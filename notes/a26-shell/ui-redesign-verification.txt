@@ -1,0 +1,19 @@
+A26 launcher redesign verification
+
+Captured from the actual X11 shell window through a26-shellshot.
+Resolution: 1080x2340
+
+PASS: generated System artwork rendered
+PASS: icon frame is exactly one physical pixel
+  border pixel (63,401) = 96,165,250
+  immediately outside (62,401) = 11,16,32
+  immediately inside (64,402) = image pixel 16,27,50
+PASS: launcher home gesture bar removed
+  old bar center (540,2285) = background 11,16,32
+PASS: on-screen lock button removed
+PASS: System scene retains its bottom gesture bar
+PASS: power screen-off/on policy still locks before wake
+
+Screenshots:
+  notes/a26-shell/launcher-redesign.png
+  notes/a26-shell/system-view.png

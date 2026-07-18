@@ -1,0 +1,32 @@
+# This repository publishes only the A26 shell, its helper scripts, and the
+# curated design notes. The surrounding device-research workspace is private.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/src/
+!/scripts/
+!/notes/
+
+/src/*
+!/src/a26-shell/
+/src/a26-shell/target/
+
+/scripts/*
+!/scripts/a26-shell/
+/scripts/a26-shell/__pycache__/
+
+/notes/*
+!/notes/a26-shell/
+/notes/a26-shell/*
+!/notes/a26-shell/README.md
+!/notes/a26-shell/launcher-redesign.png
+!/notes/a26-shell/system-view.png
+!/notes/a26-shell/ui-redesign-verification.txt
+
+# Generated locally by the build/install/test workflow.
+/build/
+/images/
+*.log
+*.ppm
+*.tmp

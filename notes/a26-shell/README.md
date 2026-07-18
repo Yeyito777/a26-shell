@@ -1,0 +1,46 @@
+# A26 Shell design notes
+
+A26 Shell is a minimal Rust phone shell/window manager targeting native Xorg on
+the Samsung Galaxy A26 (SM-A266M).
+
+## Current interface
+
+- numeric lock screen;
+- minimal app-grid launcher with generated System artwork;
+- exact one-physical-pixel app-icon frame;
+- no on-screen lock button—the physical power key locks and blanks the panel;
+- no gesture bar on the launcher;
+- System scene with device and Linux runtime information;
+- bottom-edge gesture bar inside System, where swiping up closes the app;
+- volume overlay and root-only ADB/Unix-socket development controls.
+
+## Captured output
+
+These images were captured from the actual X11 shell window with the included
+`a26-shellshot` utility rather than through Android SurfaceFlinger.
+
+### Launcher
+
+![Launcher](launcher-redesign.png)
+
+### System app
+
+![System app](system-view.png)
+
+Pixel-level layout checks are recorded in
+[`ui-redesign-verification.txt`](ui-redesign-verification.txt).
+
+## Verified development behavior
+
+- Xorg window size: 1080x2340
+- XInput 2.2 raw touch begin/update/end decoding
+- lock-screen keypad hit testing
+- System app launch and bottom-edge close gesture
+- power-off lock, backlight zero, and lock-only wake
+- safe WM restart while the panel is blanked
+- root-only control socket and configuration permissions
+- static aarch64-musl build
+
+The lock screen is intentionally only a session UI. The reference development
+device has an unlocked bootloader, root, and authorized ADB, all of which can
+bypass the shell.

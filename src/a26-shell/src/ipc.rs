@@ -1,0 +1,187 @@
+use serde::Serialize;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub enum Command {
+    Ping,
+    State,
+    Digit(u8),
+    Backspace,
+    Submit,
+    Tap(i16, i16),
+    PointerBegin(i16, i16),
+    PointerMove(i16, i16),
+    PointerEnd(i16, i16),
+    Lock,
+    Home,
+    LaunchSystem,
+    SwipeUp,
+    VolumeUp,
+    VolumeDown,
+    VolumeSet(u8),
+    Power,
+    ScreenOff,
+    ScreenOn,
+    Quit,
+}
+
+pub struct IpcServer {
+    listener: UnixListener,
+    path: PathBuf,
+}
+
+impl IpcServer {
+    pub fn bind(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn accept_all(&self) -> Vec<(UnixStream, Result<Command, String>)> {
+        let mut requests = Vec::new();
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let mut line = String::new();
+                    let result = BufReader::new(&mut stream)
+                        .read_line(&mut line)
+                        .map_err(|error| error.to_string())
+                        .and_then(|_| parse_command(line.trim()));
+                    requests.push((stream, result));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    eprintln!("IPC accept failed: {error}");
+                    break;
+                }
+            }
+        }
+        requests
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn respond<T: Serialize>(mut stream: UnixStream, result: Result<&T, &str>) {
+    #[derive(Serialize)]
+    struct Envelope<'a, T: Serialize> {
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<&'a T>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    }
+    let envelope = match result {
+        Ok(value) => Envelope {
+            ok: true,
+            result: Some(value),
+            error: None,
+        },
+        Err(error) => Envelope {
+            ok: false,
+            result: None,
+            error: Some(error),
+        },
+    };
+    let _ = serde_json::to_writer(&mut stream, &envelope);
+    let _ = stream.write_all(b"\n");
+    let _ = stream.flush();
+}
+
+fn parse_command(line: &str) -> Result<Command, String> {
+    let mut parts = line.split_whitespace();
+    let name = parts.next().ok_or_else(|| "empty command".to_string())?;
+    let parse_i16 = |value: Option<&str>, label: &str| {
+        value
+            .ok_or_else(|| format!("missing {label}"))?
+            .parse::<i16>()
+            .map_err(|_| format!("invalid {label}"))
+    };
+    let no_extra = |mut parts: std::str::SplitWhitespace<'_>| {
+        if parts.next().is_some() {
+            Err("too many arguments".to_string())
+        } else {
+            Ok(())
+        }
+    };
+
+    let command = match name {
+        "ping" => Command::Ping,
+        "state" => Command::State,
+        "backspace" => Command::Backspace,
+        "submit" => Command::Submit,
+        "lock" => Command::Lock,
+        "home" => Command::Home,
+        "swipe-up" => Command::SwipeUp,
+        "power" => Command::Power,
+        "quit" => Command::Quit,
+        "digit" => {
+            let digit = parts
+                .next()
+                .ok_or_else(|| "missing digit".to_string())?
+                .parse::<u8>()
+                .map_err(|_| "invalid digit".to_string())?;
+            if digit > 9 {
+                return Err("digit must be 0 through 9".into());
+            }
+            Command::Digit(digit)
+        }
+        "tap" => Command::Tap(parse_i16(parts.next(), "x")?, parse_i16(parts.next(), "y")?),
+        "pointer-begin" => {
+            Command::PointerBegin(parse_i16(parts.next(), "x")?, parse_i16(parts.next(), "y")?)
+        }
+        "pointer-move" => {
+            Command::PointerMove(parse_i16(parts.next(), "x")?, parse_i16(parts.next(), "y")?)
+        }
+        "pointer-end" => {
+            Command::PointerEnd(parse_i16(parts.next(), "x")?, parse_i16(parts.next(), "y")?)
+        }
+        "launch" => match parts.next() {
+            Some(value) if value.eq_ignore_ascii_case("system") => Command::LaunchSystem,
+            Some(_) => return Err("only the System app exists".into()),
+            None => return Err("missing app noun".into()),
+        },
+        "volume" => match parts.next() {
+            Some("up") => Command::VolumeUp,
+            Some("down") => Command::VolumeDown,
+            Some(value) => Command::VolumeSet(
+                value
+                    .parse::<u8>()
+                    .map_err(|_| "invalid volume".to_string())?
+                    .min(100),
+            ),
+            None => return Err("volume requires up, down, or 0..100".into()),
+        },
+        "screen" => match parts.next() {
+            Some("off") => Command::ScreenOff,
+            Some("on") => Command::ScreenOn,
+            Some(_) => return Err("screen requires on or off".into()),
+            None => return Err("screen requires on or off".into()),
+        },
+        _ => return Err(format!("unknown command: {name}")),
+    };
+    no_extra(parts)?;
+    Ok(command)
+}
