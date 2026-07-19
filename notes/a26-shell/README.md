@@ -10,7 +10,8 @@ the Samsung Galaxy A26 (SM-A266M).
 - exact one-physical-pixel app-icon frame;
 - no on-screen lock button—the physical power key locks and blanks the panel;
 - no gesture bar on the launcher;
-- System scene with device and Linux runtime information;
+- System scene with device and Linux runtime information, live CPU/GPU
+  utilization, and used/remaining filesystem space;
 - bottom-edge gesture bar inside System, where swiping up closes the app;
 - volume overlay and root-only ADB/Unix-socket development controls.
 

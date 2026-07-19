@@ -22,6 +22,7 @@ root-only Unix-socket control interface for development over ADB.
 - XInput 2.2 raw-touch handling for the A26 touchscreen
 - Salted PIN configuration with constant-time verification
 - Power-button lock and panel-backlight control
+- Live CPU/GPU utilization and used/remaining storage in the System app
 - Generated System app artwork with an exact one-pixel launcher frame
 - Static `aarch64-unknown-linux-musl` deployment binaries
 - Root-only JSON IPC and deterministic ADB test controls

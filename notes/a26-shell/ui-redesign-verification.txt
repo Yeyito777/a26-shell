@@ -13,6 +13,8 @@ PASS: launcher home gesture bar removed
 PASS: on-screen lock button removed
 PASS: System scene retains its bottom gesture bar
 PASS: power screen-off/on policy still locks before wake
+PASS: System scene displays live CPU and Mali GPU utilization
+PASS: System scene displays used and remaining root-filesystem space
 
 Screenshots:
   notes/a26-shell/launcher-redesign.png

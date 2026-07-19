@@ -12,6 +12,7 @@ Current features:
 - touch-first launcher containing the **System** app;
 - generated System app artwork with a one-pixel launcher frame;
 - built-in System information view;
+- live CPU/GPU utilization and used/remaining filesystem space;
 - bottom-edge swipe-up app close gesture;
 - volume-key handling and volume overlay;
 - physical power-key lock/screen blanking with panel-backlight control;

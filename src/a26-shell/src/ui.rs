@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::ffi::CString;
 use std::fs;
+use std::mem::MaybeUninit;
 use std::time::Instant;
 
 use x11rb::connection::Connection;
@@ -20,19 +22,28 @@ const DANGER: u32 = 0xfb7185;
 const SYSTEM_ICON_SIZE: u16 = 220;
 const SYSTEM_ICON: &[u8] = include_bytes!("../assets/system-app.bgrx");
 
+#[derive(Debug, Clone, Copy)]
+struct CpuTimes {
+    total: u64,
+    idle: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemInfo {
     pub kernel: String,
     pub alpine: String,
     pub memory: String,
-    pub hostname: String,
+    pub cpu_usage: Option<u8>,
+    pub gpu_usage: Option<u8>,
+    pub storage_used: String,
+    pub storage_remaining: String,
+    previous_cpu: Option<CpuTimes>,
 }
 
 impl SystemInfo {
     pub fn collect() -> Self {
         let kernel = read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "UNKNOWN".into());
         let alpine = read_trimmed("/etc/alpine-release").unwrap_or_else(|| "UNKNOWN".into());
-        let hostname = read_trimmed("/proc/sys/kernel/hostname").unwrap_or_else(|| "A26".into());
         let memory = fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|text| {
@@ -43,17 +54,102 @@ impl SystemInfo {
                 })
             })
             .unwrap_or_else(|| "UNKNOWN".into());
-        Self {
+        let (storage_used, storage_remaining) = storage_usage("/")
+            .map(|(used, remaining)| (format_bytes(used), format_bytes(remaining)))
+            .unwrap_or_else(|| ("UNKNOWN".into(), "UNKNOWN".into()));
+        let mut result = Self {
             kernel,
             alpine,
             memory,
-            hostname,
+            cpu_usage: None,
+            gpu_usage: read_gpu_usage(),
+            storage_used,
+            storage_remaining,
+            previous_cpu: None,
+        };
+        result.refresh();
+        result
+    }
+
+    pub fn refresh(&mut self) {
+        if let Some(current) = read_cpu_times() {
+            if let Some(previous) = self.previous_cpu {
+                self.cpu_usage = cpu_usage(previous, current);
+            }
+            self.previous_cpu = Some(current);
+        }
+        self.gpu_usage = read_gpu_usage();
+        if let Some((used, remaining)) = storage_usage("/") {
+            self.storage_used = format_bytes(used);
+            self.storage_remaining = format_bytes(remaining);
         }
     }
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
     Some(fs::read_to_string(path).ok()?.trim().to_string())
+}
+
+fn read_cpu_times() -> Option<CpuTimes> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let mut fields = stat.lines().next()?.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let values: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
+    if values.len() < 5 {
+        return None;
+    }
+    Some(CpuTimes {
+        total: values.iter().copied().sum(),
+        idle: values[3].saturating_add(values[4]),
+    })
+}
+
+fn cpu_usage(previous: CpuTimes, current: CpuTimes) -> Option<u8> {
+    let total = current.total.saturating_sub(previous.total);
+    if total == 0 {
+        return None;
+    }
+    let idle = current.idle.saturating_sub(previous.idle).min(total);
+    let busy = total - idle;
+    Some(((busy.saturating_mul(100) + total / 2) / total).min(100) as u8)
+}
+
+fn read_gpu_usage() -> Option<u8> {
+    read_trimmed("/sys/class/misc/mali0/device/utilization")?
+        .split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .map(|value| value.min(100) as u8)
+}
+
+fn storage_usage(path: &str) -> Option<(u64, u64)> {
+    let path = CString::new(path).ok()?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a live NUL-terminated C string and `stats` points to
+    // writable storage for one `statvfs` result. The result is read only when
+    // libc reports success.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful libc call above initialized the complete struct.
+    let stats = unsafe { stats.assume_init() };
+    let block_size = stats.f_frsize.max(1);
+    let total = stats.f_blocks.saturating_mul(block_size);
+    let free = stats.f_bfree.saturating_mul(block_size);
+    let remaining = stats.f_bavail.saturating_mul(block_size);
+    Some((total.saturating_sub(free), remaining))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("{:.1} GB", bytes as f64 / GIB)
+}
+
+fn usage_text(usage: Option<u8>) -> String {
+    usage.map_or_else(|| "--%".into(), |value| format!("{value}%"))
 }
 
 pub struct Renderer {
@@ -65,6 +161,10 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn refresh_system(&mut self) {
+        self.system.refresh();
+    }
+
     pub fn render<C: Connection>(
         &self,
         conn: &C,
@@ -210,26 +310,62 @@ impl Renderer {
     ) -> Result<(), Box<dyn Error>> {
         self.text(conn, "SYSTEM", 70, 100, 10, ACCENT)?;
         self.text(conn, &format!("VOLUME {}", state.volume), 70, 260, 5, MUTED)?;
-        self.card_line(conn, 420, "DEVICE", "SAMSUNG GALAXY A26")?;
-        self.card_line(conn, 610, "HOST", &self.system.hostname)?;
-        self.card_line(conn, 800, "KERNEL", &self.system.kernel)?;
+        let cpu = usage_text(self.system.cpu_usage);
+        let gpu = usage_text(self.system.gpu_usage);
+        self.metric_card(conn, (55, 390), "CPU", &cpu, ACCENT)?;
+        self.metric_card(conn, (555, 390), "GPU", &gpu, ACCENT_2)?;
+        self.metric_card(conn, (55, 575), "SPACE USED", &self.system.storage_used, FG)?;
+        self.metric_card(
+            conn,
+            (555, 575),
+            "SPACE FREE",
+            &self.system.storage_remaining,
+            FG,
+        )?;
+        self.card_line(conn, 780, "DEVICE", "SAMSUNG GALAXY A26")?;
+        self.card_line(conn, 945, "KERNEL", &self.system.kernel)?;
         self.card_line(
             conn,
-            990,
+            1110,
             "ROOTFS",
             &format!("ALPINE {}", self.system.alpine),
         )?;
-        self.card_line(conn, 1180, "MEMORY", &self.system.memory)?;
+        self.card_line(conn, 1275, "MEMORY", &self.system.memory)?;
         self.card_line(
             conn,
-            1370,
+            1440,
             "DISPLAY",
             &format!("{}X{} 120 HZ", self.width, self.height),
         )?;
-        self.card_line(conn, 1560, "WINDOW MANAGER", "A26 SHELL RUST")?;
-        self.card_line(conn, 1750, "CONTROL", "ADB UNIX SOCKET")?;
+        self.card_line(conn, 1605, "WINDOW MANAGER", "A26 SHELL RUST")?;
+        self.card_line(conn, 1770, "CONTROL", "ADB UNIX SOCKET")?;
         self.center_text(conn, "SWIPE UP FROM BELOW TO CLOSE", 2150, 4, MUTED)?;
         self.home_bar(conn)?;
+        Ok(())
+    }
+
+    fn metric_card<C: Connection>(
+        &self,
+        conn: &C,
+        position: (i16, i16),
+        noun: &str,
+        value: &str,
+        color: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let (x, y) = position;
+        self.fill(
+            conn,
+            BG_CARD,
+            Rectangle {
+                x,
+                y,
+                width: 470,
+                height: 145,
+            },
+        )?;
+        self.text(conn, noun, x + 28, y + 24, 3, MUTED)?;
+        let clipped: String = value.chars().take(12).collect();
+        self.text(conn, &clipped, x + 28, y + 73, 6, color)?;
         Ok(())
     }
 
@@ -479,4 +615,27 @@ fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
 
 fn inside_button(x: i16, y: i16, cx: i16, cy: i16) -> bool {
     (i32::from(x) - i32::from(cx)).abs() <= 120 && (i32::from(y) - i32::from(cy)).abs() <= 120
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_usage_uses_busy_delta() {
+        let previous = CpuTimes {
+            total: 1_000,
+            idle: 700,
+        };
+        let current = CpuTimes {
+            total: 1_200,
+            idle: 780,
+        };
+        assert_eq!(cpu_usage(previous, current), Some(60));
+    }
+
+    #[test]
+    fn storage_size_is_human_readable() {
+        assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GB");
+    }
 }

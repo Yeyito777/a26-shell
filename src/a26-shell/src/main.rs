@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     conn.flush()?;
 
-    let renderer = Renderer {
+    let mut renderer = Renderer {
         window: shell_window,
         gc,
         width,
@@ -163,6 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut hardware_awake = true;
     let mut raw_touch = RawTouchTracker::default();
+    let mut next_system_refresh = Instant::now();
     renderer.render(&conn, &state)?;
     if let Some(device) = backlight.as_ref() {
         if let Err(error) = device.on() {
@@ -216,6 +217,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         state.tick();
+        let now = Instant::now();
+        if state.view == View::System && now >= next_system_refresh {
+            renderer.refresh_system();
+            state.redraw = true;
+            next_system_refresh = now + Duration::from_secs(1);
+        }
         if state.screen_awake != hardware_awake {
             // Draw the safe frame before changing brightness. During wake the
             // lock screen is therefore complete before the panel lights up.
