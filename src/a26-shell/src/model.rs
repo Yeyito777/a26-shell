@@ -11,6 +11,13 @@ pub enum View {
     Locked,
     Launcher,
     System,
+    Browser,
+}
+
+impl View {
+    pub fn is_app(self) -> bool {
+        matches!(self, Self::System | Self::Browser)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +98,11 @@ impl ShellState {
             pin_digits: self.pin_input.len(),
             failed_attempts: self.failed_attempts,
             lockout_remaining_ms: remaining.as_millis().min(u64::MAX as u128) as u64,
-            current_app: (self.view == View::System).then_some("System"),
+            current_app: match self.view {
+                View::System => Some("System"),
+                View::Browser => Some("Browser"),
+                View::Locked | View::Launcher => None,
+            },
             volume: self.volume,
             width,
             height,
@@ -141,6 +152,14 @@ impl ShellState {
         if self.screen_awake && self.view != View::Locked {
             self.view = View::System;
             self.last_action = "launch_system".into();
+            self.redraw = true;
+        }
+    }
+
+    pub fn launch_browser(&mut self) {
+        if self.screen_awake && self.view != View::Locked {
+            self.view = View::Browser;
+            self.last_action = "launch_browser".into();
             self.redraw = true;
         }
     }
@@ -307,5 +326,14 @@ mod tests {
         state.screen_on();
         assert!(state.screen_awake);
         assert_eq!(state.view, View::Locked);
+    }
+
+    #[test]
+    fn browser_is_a_first_class_external_app() {
+        let mut state = ShellState::new(false, 50);
+        state.launch_browser();
+        assert_eq!(state.view, View::Browser);
+        assert_eq!(state.public(1080, 2340).current_app, Some("Browser"));
+        assert!(state.view.is_app());
     }
 }

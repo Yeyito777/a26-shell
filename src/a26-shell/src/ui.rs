@@ -17,14 +17,21 @@ const MUTED: u32 = 0x94a3b8;
 const ACCENT: u32 = 0x5eead4;
 const ACCENT_2: u32 = 0x60a5fa;
 const DANGER: u32 = 0xfb7185;
-const SYSTEM_ICON_SIZE: u16 = 220;
-const SYSTEM_ICON_BYTES: usize = SYSTEM_ICON_SIZE as usize * SYSTEM_ICON_SIZE as usize * 4;
+const APP_ICON_SIZE: u16 = 220;
+const APP_ICON_BYTES: usize = APP_ICON_SIZE as usize * APP_ICON_SIZE as usize * 4;
 const SYSTEM_ICON_PATH: &str = "/opt/a26-system/share/system-app.bgrx";
+const BROWSER_ICON_PATH: &str = "/opt/vimbrowser-a26/share/browser-app.bgrx";
 
 pub fn load_system_icon() -> Option<Vec<u8>> {
     fs::read(SYSTEM_ICON_PATH)
         .ok()
-        .filter(|bytes| bytes.len() == SYSTEM_ICON_BYTES)
+        .filter(|bytes| bytes.len() == APP_ICON_BYTES)
+}
+
+pub fn load_browser_icon() -> Option<Vec<u8>> {
+    fs::read(BROWSER_ICON_PATH)
+        .ok()
+        .filter(|bytes| bytes.len() == APP_ICON_BYTES)
 }
 
 pub struct Renderer {
@@ -33,6 +40,7 @@ pub struct Renderer {
     pub width: u16,
     pub height: u16,
     pub system_icon: Option<Vec<u8>>,
+    pub browser_icon: Option<Vec<u8>>,
 }
 
 impl Renderer {
@@ -60,7 +68,7 @@ impl Renderer {
         match state.view {
             View::Locked => self.render_lock(conn, state)?,
             View::Launcher => self.render_launcher(conn, state)?,
-            View::System => {}
+            View::System | View::Browser => {}
         }
         if state
             .volume_overlay_until
@@ -155,10 +163,10 @@ impl Renderer {
         let icon = Rectangle {
             x: 64,
             y: 402,
-            width: SYSTEM_ICON_SIZE,
-            height: SYSTEM_ICON_SIZE,
+            width: APP_ICON_SIZE,
+            height: APP_ICON_SIZE,
         };
-        self.system_icon(conn, icon.x, icon.y)?;
+        self.app_icon(conn, self.system_icon.as_deref(), icon.x, icon.y, "SYS")?;
         self.outline(
             conn,
             ACCENT_2,
@@ -170,7 +178,33 @@ impl Renderer {
             },
             1,
         )?;
-        self.centered_in(conn, "SYSTEM", (64, 658, SYSTEM_ICON_SIZE), 5, FG)?;
+        self.centered_in(conn, "SYSTEM", (64, 658, APP_ICON_SIZE), 5, FG)?;
+
+        let browser = Rectangle {
+            x: 380,
+            y: 402,
+            width: APP_ICON_SIZE,
+            height: APP_ICON_SIZE,
+        };
+        self.app_icon(
+            conn,
+            self.browser_icon.as_deref(),
+            browser.x,
+            browser.y,
+            "WEB",
+        )?;
+        self.outline(
+            conn,
+            ACCENT,
+            Rectangle {
+                x: browser.x - 1,
+                y: browser.y - 1,
+                width: browser.width + 2,
+                height: browser.height + 2,
+            },
+            1,
+        )?;
+        self.centered_in(conn, "BROWSER", (380, 658, APP_ICON_SIZE), 5, FG)?;
         Ok(())
     }
 
@@ -212,14 +246,21 @@ impl Renderer {
         Ok(())
     }
 
-    fn system_icon<C: Connection>(&self, conn: &C, x: i16, y: i16) -> Result<(), Box<dyn Error>> {
-        if let Some(icon) = self.system_icon.as_deref() {
+    fn app_icon<C: Connection>(
+        &self,
+        conn: &C,
+        icon: Option<&[u8]>,
+        x: i16,
+        y: i16,
+        fallback: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(icon) = icon {
             conn.put_image(
                 ImageFormat::Z_PIXMAP,
                 self.window,
                 self.gc,
-                SYSTEM_ICON_SIZE,
-                SYSTEM_ICON_SIZE,
+                APP_ICON_SIZE,
+                APP_ICON_SIZE,
                 x,
                 y,
                 0,
@@ -233,11 +274,11 @@ impl Renderer {
                 Rectangle {
                     x,
                     y,
-                    width: SYSTEM_ICON_SIZE,
-                    height: SYSTEM_ICON_SIZE,
+                    width: APP_ICON_SIZE,
+                    height: APP_ICON_SIZE,
                 },
             )?;
-            self.centered_in(conn, "SYS", (x, y + 72, SYSTEM_ICON_SIZE), 10, FG)?;
+            self.centered_in(conn, fallback, (x, y + 72, APP_ICON_SIZE), 10, FG)?;
         }
         Ok(())
     }
@@ -390,6 +431,10 @@ pub fn system_app_at(x: i16, y: i16) -> bool {
     (48..=300).contains(&x) && (380..=710).contains(&y)
 }
 
+pub fn browser_app_at(x: i16, y: i16) -> bool {
+    (364..=616).contains(&x) && (380..=710).contains(&y)
+}
+
 fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
     let x = i32::from(width) * i32::from(column + 1) / 4;
     let y = 830 + i32::from(row) * 285;
@@ -398,4 +443,17 @@ fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
 
 fn inside_button(x: i16, y: i16, cx: i16, cy: i16) -> bool {
     (i32::from(x) - i32::from(cx)).abs() <= 120 && (i32::from(y) - i32::from(cy)).abs() <= 120
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_tiles_have_separate_hit_regions() {
+        assert!(system_app_at(174, 512));
+        assert!(!browser_app_at(174, 512));
+        assert!(browser_app_at(490, 512));
+        assert!(!system_app_at(490, 512));
+    }
 }

@@ -19,6 +19,7 @@ use model::{PointerGesture, ShellState, View};
 use ui::{KeypadAction, Renderer};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux,
@@ -31,6 +32,7 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 const KEY_VOLUME_DOWN: u8 = 122;
 const KEY_VOLUME_UP: u8 = 123;
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
+const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
 
 #[derive(Default)]
 struct RawTouchTracker {
@@ -67,6 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    conn.xfixes_query_version(4, 0)?.reply()?;
     let raw_touch_mask = xinput::XIEventMask::RAW_TOUCH_BEGIN
         | xinput::XIEventMask::RAW_TOUCH_UPDATE
         | xinput::XIEventMask::RAW_TOUCH_END;
@@ -122,6 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, shell_window, &CreateGCAux::new().graphics_exposures(0))?;
     conn.map_window(shell_window)?;
+    conn.xfixes_hide_cursor(shell_window)?.check()?;
     raise_shell(&conn, shell_window)?;
     conn.set_input_focus(InputFocus::PARENT, shell_window, CURRENT_TIME)?;
     for keycode in [KEY_VOLUME_DOWN, KEY_VOLUME_UP] {
@@ -143,6 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         width,
         height,
         system_icon: ui::load_system_icon(),
+        browser_icon: ui::load_browser_icon(),
     };
     let ipc = IpcServer::bind(&config.socket_path)?;
     let mut state = ShellState::new(config.start_locked, config.initial_volume);
@@ -166,6 +171,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut hardware_awake = true;
     let mut raw_touch = RawTouchTracker::default();
     let mut system_app: Option<Child> = None;
+    let mut browser_app: Option<Child> = None;
     renderer.render(&conn, &state)?;
     if let Some(device) = backlight.as_ref() {
         if let Err(error) = device.on() {
@@ -218,7 +224,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        reconcile_system_app(&mut state, &mut system_app);
+        reconcile_apps(&mut state, &mut system_app, &mut browser_app);
         state.tick();
         if state.screen_awake != hardware_awake {
             // Draw the safe frame before changing brightness. During wake the
@@ -239,7 +245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             hardware_awake = state.screen_awake;
         }
         if state.redraw {
-            if state.view != View::System {
+            if !state.view.is_app() {
                 raise_shell(&conn, shell_window)?;
                 renderer.render(&conn, &state)?;
             }
@@ -262,6 +268,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     stop_system_app(&mut system_app);
+    stop_system_app(&mut browser_app);
     let _ = conn.destroy_window(shell_window);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
@@ -341,12 +348,13 @@ fn handle_x_event(
         Event::MapRequest(event) => {
             if event.window != shell_window {
                 conn.map_window(event.window)?;
+                conn.xfixes_hide_cursor(event.window)?.check()?;
                 if !state.managed_windows.contains(&event.window) {
                     state.managed_windows.push(event.window);
                 }
                 state.last_action = "map_external_window".into();
                 state.redraw = true;
-                if state.view == View::System {
+                if state.view.is_app() {
                     fullscreen_window(conn, event.window, width, height)?;
                     conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
                 } else {
@@ -355,12 +363,17 @@ fn handle_x_event(
             }
         }
         Event::ConfigureRequest(event) => {
-            if state.view == View::System && state.managed_windows.contains(&event.window) {
+            if state.view.is_app() && state.managed_windows.contains(&event.window) {
                 fullscreen_window(conn, event.window, width, height)?;
             } else {
                 let aux = ConfigureWindowAux::from_configure_request(&event);
                 conn.configure_window(event.window, &aux)?;
-                raise_shell(conn, shell_window)?;
+                // Browser engines create auxiliary clipboard, selection, and
+                // popup windows. Their configure requests must not raise the
+                // shell over the application's primary window.
+                if !state.view.is_app() {
+                    raise_shell(conn, shell_window)?;
+                }
             }
         }
         Event::DestroyNotify(event) => {
@@ -423,37 +436,61 @@ fn fullscreen_window(
     Ok(())
 }
 
-fn reconcile_system_app(state: &mut ShellState, child: &mut Option<Child>) {
-    if state.view != View::System {
-        stop_system_app(child);
-        return;
+fn reconcile_apps(
+    state: &mut ShellState,
+    system_child: &mut Option<Child>,
+    browser_child: &mut Option<Child>,
+) {
+    match state.view {
+        View::System => {
+            stop_system_app(browser_child);
+            let executable = env::var_os("A26_SYSTEM_APP")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| DEFAULT_SYSTEM_APP.into());
+            reconcile_app(state, system_child, &executable, "System");
+        }
+        View::Browser => {
+            stop_system_app(system_child);
+            let executable = env::var_os("A26_BROWSER_APP")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| DEFAULT_BROWSER_APP.into());
+            reconcile_app(state, browser_child, &executable, "Browser");
+        }
+        View::Locked | View::Launcher => {
+            stop_system_app(system_child);
+            stop_system_app(browser_child);
+        }
     }
+}
 
+fn reconcile_app(
+    state: &mut ShellState,
+    child: &mut Option<Child>,
+    executable: &PathBuf,
+    name: &str,
+) {
     if let Some(process) = child.as_mut() {
         match process.try_wait() {
             Ok(Some(status)) => {
-                eprintln!("a26-system exited with {status}");
+                eprintln!("{name} exited with {status}");
                 *child = None;
                 state.home();
-                state.last_action = "system_process_exited".into();
+                state.last_action = format!("{}_process_exited", name.to_ascii_lowercase());
             }
             Ok(None) => return,
             Err(error) => {
-                eprintln!("cannot inspect a26-system: {error}");
+                eprintln!("cannot inspect {name}: {error}");
                 stop_system_app(child);
                 state.home();
-                state.last_action = "system_process_error".into();
+                state.last_action = format!("{}_process_error", name.to_ascii_lowercase());
             }
         }
     }
 
-    if state.view != View::System || child.is_some() {
+    if !state.view.is_app() || child.is_some() {
         return;
     }
-    let executable = env::var_os("A26_SYSTEM_APP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| DEFAULT_SYSTEM_APP.into());
-    match ProcessCommand::new(&executable)
+    match ProcessCommand::new(executable)
         .env(
             "DISPLAY",
             env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
@@ -462,14 +499,14 @@ fn reconcile_system_app(state: &mut ShellState, child: &mut Option<Child>) {
         .spawn()
     {
         Ok(process) => {
-            eprintln!("started a26-system pid={}", process.id());
+            eprintln!("started {name} pid={}", process.id());
             *child = Some(process);
-            state.last_action = "system_process_started".into();
+            state.last_action = format!("{}_process_started", name.to_ascii_lowercase());
         }
         Err(error) => {
             eprintln!("cannot start {}: {error}", executable.display());
             state.home();
-            state.last_action = "system_launch_failed".into();
+            state.last_action = format!("{}_launch_failed", name.to_ascii_lowercase());
         }
     }
 }
@@ -513,7 +550,7 @@ fn pointer_end(state: &mut ShellState, x: i16, y: i16, width: u16, height: u16, 
     let elapsed = pointer.started.elapsed();
     let upward = -dy;
     let bottom_start = i32::from(pointer.start_y) >= i32::from(height) - 180;
-    let close_swipe = state.view == View::System
+    let close_swipe = state.view.is_app()
         && bottom_start
         && upward >= 350
         && dx.abs() <= 300
@@ -545,11 +582,14 @@ fn handle_tap(state: &mut ShellState, x: i16, y: i16, width: u16, config: &Confi
         View::Launcher => {
             if ui::system_app_at(x, y) {
                 state.launch_system();
+            } else if ui::browser_app_at(x, y) {
+                state.launch_browser();
             } else {
                 state.last_action = "launcher_tap_outside".into();
             }
         }
         View::System => state.last_action = "system_tap".into(),
+        View::Browser => state.last_action = "browser_tap".into(),
     }
     state.redraw = true;
 }
@@ -575,8 +615,9 @@ fn apply_command(
         Command::Lock => state.lock(),
         Command::Home => state.home(),
         Command::LaunchSystem => state.launch_system(),
+        Command::LaunchBrowser => state.launch_browser(),
         Command::SwipeUp => {
-            if state.view == View::System {
+            if state.view.is_app() {
                 state.home();
                 state.last_action = "swipe_up_close".into();
             }

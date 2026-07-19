@@ -20,6 +20,7 @@ pub enum Command {
     Lock,
     Home,
     LaunchSystem,
+    LaunchBrowser,
     SwipeUp,
     VolumeUp,
     VolumeDown,
@@ -160,7 +161,8 @@ fn parse_command(line: &str) -> Result<Command, String> {
         }
         "launch" => match parts.next() {
             Some(value) if value.eq_ignore_ascii_case("system") => Command::LaunchSystem,
-            Some(_) => return Err("only the System app exists".into()),
+            Some(value) if value.eq_ignore_ascii_case("browser") => Command::LaunchBrowser,
+            Some(_) => return Err("app must be System or Browser".into()),
             None => return Err("missing app noun".into()),
         },
         "volume" => match parts.next() {

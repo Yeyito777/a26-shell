@@ -9,9 +9,11 @@ Current features:
 
 - fullscreen numeric lock screen;
 - salted, hashed six-digit PIN configuration (no plaintext PIN in source);
-- touch-first launcher containing the **System** app;
+- touch-first launcher containing separate **System** and **Browser** apps;
 - app-provided System artwork with a one-pixel launcher frame;
 - external `a26-system` process launch and fullscreen lifecycle management;
+- external ARM64 vimbrowser launch and fullscreen lifecycle management;
+- hidden X11 cursor on touch-only shell and app surfaces;
 - bottom-edge swipe-up app close gesture;
 - volume-key handling and volume overlay;
 - physical power-key lock/screen blanking with panel-backlight control;
@@ -23,6 +25,11 @@ The standalone System app lives at
 <https://github.com/Yeyito777/a26-system>. It installs its executable and icon
 under `/opt/a26-system`; the shell does not contain the System renderer or
 telemetry implementation.
+
+The standalone Browser app is vimbrowser. Its A26 installation provides
+`/opt/vimbrowser-a26/bin/vimbrowser-a26` and
+`/opt/vimbrowser-a26/share/browser-app.bgrx`; the shell only owns the launcher
+tile and process lifecycle.
 
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
@@ -40,7 +47,7 @@ Runtime paths on the phone:
 ```
 
 Useful host controls include `state`, `lock`, `screen on`, `screen off`,
-`launch system`, `swipe-up`, `volume up`, and pointer/tap injection. They are
+`launch system`, `launch browser`, `swipe-up`, `volume up`, and pointer/tap injection. They are
 exposed through `scripts/a26-shell/ctl.sh` and the root-only Unix socket.
 `scripts/a26-shell/screenshot.sh` captures the actual X11 shell window over
 ADB without relying on Android SurfaceFlinger.
