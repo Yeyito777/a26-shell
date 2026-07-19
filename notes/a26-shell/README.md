@@ -10,8 +10,8 @@ the Samsung Galaxy A26 (SM-A266M).
 - exact one-physical-pixel app-icon frame;
 - no on-screen lock button—the physical power key locks and blanks the panel;
 - no gesture bar on the launcher;
-- System scene with device and Linux runtime information, live CPU/GPU
-  utilization, and used/remaining filesystem space;
+- separately managed `a26-system` application with device/Linux information,
+  live CPU/GPU utilization, and used/remaining filesystem space;
 - bottom-edge gesture bar inside System, where swiping up closes the app;
 - volume overlay and root-only ADB/Unix-socket development controls.
 
@@ -37,6 +37,7 @@ Pixel-level layout checks are recorded in
 - XInput 2.2 raw touch begin/update/end decoding
 - lock-screen keypad hit testing
 - System app launch and bottom-edge close gesture
+- normal X11 app window mapped fullscreen and terminated on close/power lock
 - power-off lock, backlight zero, and lock-only wake
 - safe WM restart while the panel is blanked
 - root-only control socket and configuration permissions

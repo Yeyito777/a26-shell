@@ -1,7 +1,5 @@
 use std::error::Error;
-use std::ffi::CString;
 use std::fs;
-use std::mem::MaybeUninit;
 use std::time::Instant;
 
 use x11rb::connection::Connection;
@@ -20,136 +18,13 @@ const ACCENT: u32 = 0x5eead4;
 const ACCENT_2: u32 = 0x60a5fa;
 const DANGER: u32 = 0xfb7185;
 const SYSTEM_ICON_SIZE: u16 = 220;
-const SYSTEM_ICON: &[u8] = include_bytes!("../assets/system-app.bgrx");
+const SYSTEM_ICON_BYTES: usize = SYSTEM_ICON_SIZE as usize * SYSTEM_ICON_SIZE as usize * 4;
+const SYSTEM_ICON_PATH: &str = "/opt/a26-system/share/system-app.bgrx";
 
-#[derive(Debug, Clone, Copy)]
-struct CpuTimes {
-    total: u64,
-    idle: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct SystemInfo {
-    pub kernel: String,
-    pub alpine: String,
-    pub memory: String,
-    pub cpu_usage: Option<u8>,
-    pub gpu_usage: Option<u8>,
-    pub storage_used: String,
-    pub storage_remaining: String,
-    previous_cpu: Option<CpuTimes>,
-}
-
-impl SystemInfo {
-    pub fn collect() -> Self {
-        let kernel = read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "UNKNOWN".into());
-        let alpine = read_trimmed("/etc/alpine-release").unwrap_or_else(|| "UNKNOWN".into());
-        let memory = fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|text| {
-                text.lines().find_map(|line| {
-                    let value = line.strip_prefix("MemTotal:")?.split_whitespace().next()?;
-                    let kib: u64 = value.parse().ok()?;
-                    Some(format!("{} MB", kib / 1024))
-                })
-            })
-            .unwrap_or_else(|| "UNKNOWN".into());
-        let (storage_used, storage_remaining) = storage_usage("/")
-            .map(|(used, remaining)| (format_bytes(used), format_bytes(remaining)))
-            .unwrap_or_else(|| ("UNKNOWN".into(), "UNKNOWN".into()));
-        let mut result = Self {
-            kernel,
-            alpine,
-            memory,
-            cpu_usage: None,
-            gpu_usage: read_gpu_usage(),
-            storage_used,
-            storage_remaining,
-            previous_cpu: None,
-        };
-        result.refresh();
-        result
-    }
-
-    pub fn refresh(&mut self) {
-        if let Some(current) = read_cpu_times() {
-            if let Some(previous) = self.previous_cpu {
-                self.cpu_usage = cpu_usage(previous, current);
-            }
-            self.previous_cpu = Some(current);
-        }
-        self.gpu_usage = read_gpu_usage();
-        if let Some((used, remaining)) = storage_usage("/") {
-            self.storage_used = format_bytes(used);
-            self.storage_remaining = format_bytes(remaining);
-        }
-    }
-}
-
-fn read_trimmed(path: &str) -> Option<String> {
-    Some(fs::read_to_string(path).ok()?.trim().to_string())
-}
-
-fn read_cpu_times() -> Option<CpuTimes> {
-    let stat = fs::read_to_string("/proc/stat").ok()?;
-    let mut fields = stat.lines().next()?.split_whitespace();
-    if fields.next()? != "cpu" {
-        return None;
-    }
-    let values: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
-    if values.len() < 5 {
-        return None;
-    }
-    Some(CpuTimes {
-        total: values.iter().copied().sum(),
-        idle: values[3].saturating_add(values[4]),
-    })
-}
-
-fn cpu_usage(previous: CpuTimes, current: CpuTimes) -> Option<u8> {
-    let total = current.total.saturating_sub(previous.total);
-    if total == 0 {
-        return None;
-    }
-    let idle = current.idle.saturating_sub(previous.idle).min(total);
-    let busy = total - idle;
-    Some(((busy.saturating_mul(100) + total / 2) / total).min(100) as u8)
-}
-
-fn read_gpu_usage() -> Option<u8> {
-    read_trimmed("/sys/class/misc/mali0/device/utilization")?
-        .split_whitespace()
-        .next()?
-        .parse::<u16>()
+pub fn load_system_icon() -> Option<Vec<u8>> {
+    fs::read(SYSTEM_ICON_PATH)
         .ok()
-        .map(|value| value.min(100) as u8)
-}
-
-fn storage_usage(path: &str) -> Option<(u64, u64)> {
-    let path = CString::new(path).ok()?;
-    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is a live NUL-terminated C string and `stats` points to
-    // writable storage for one `statvfs` result. The result is read only when
-    // libc reports success.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: the successful libc call above initialized the complete struct.
-    let stats = unsafe { stats.assume_init() };
-    let block_size = stats.f_frsize.max(1);
-    let total = stats.f_blocks.saturating_mul(block_size);
-    let free = stats.f_bfree.saturating_mul(block_size);
-    let remaining = stats.f_bavail.saturating_mul(block_size);
-    Some((total.saturating_sub(free), remaining))
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    format!("{:.1} GB", bytes as f64 / GIB)
-}
-
-fn usage_text(usage: Option<u8>) -> String {
-    usage.map_or_else(|| "--%".into(), |value| format!("{value}%"))
+        .filter(|bytes| bytes.len() == SYSTEM_ICON_BYTES)
 }
 
 pub struct Renderer {
@@ -157,14 +32,10 @@ pub struct Renderer {
     pub gc: Gcontext,
     pub width: u16,
     pub height: u16,
-    pub system: SystemInfo,
+    pub system_icon: Option<Vec<u8>>,
 }
 
 impl Renderer {
-    pub fn refresh_system(&mut self) {
-        self.system.refresh();
-    }
-
     pub fn render<C: Connection>(
         &self,
         conn: &C,
@@ -189,7 +60,7 @@ impl Renderer {
         match state.view {
             View::Locked => self.render_lock(conn, state)?,
             View::Launcher => self.render_launcher(conn, state)?,
-            View::System => self.render_system(conn, state)?,
+            View::System => {}
         }
         if state
             .volume_overlay_until
@@ -303,95 +174,6 @@ impl Renderer {
         Ok(())
     }
 
-    fn render_system<C: Connection>(
-        &self,
-        conn: &C,
-        state: &ShellState,
-    ) -> Result<(), Box<dyn Error>> {
-        self.text(conn, "SYSTEM", 70, 100, 10, ACCENT)?;
-        self.text(conn, &format!("VOLUME {}", state.volume), 70, 260, 5, MUTED)?;
-        let cpu = usage_text(self.system.cpu_usage);
-        let gpu = usage_text(self.system.gpu_usage);
-        self.metric_card(conn, (55, 390), "CPU", &cpu, ACCENT)?;
-        self.metric_card(conn, (555, 390), "GPU", &gpu, ACCENT_2)?;
-        self.metric_card(conn, (55, 575), "SPACE USED", &self.system.storage_used, FG)?;
-        self.metric_card(
-            conn,
-            (555, 575),
-            "SPACE FREE",
-            &self.system.storage_remaining,
-            FG,
-        )?;
-        self.card_line(conn, 780, "DEVICE", "SAMSUNG GALAXY A26")?;
-        self.card_line(conn, 945, "KERNEL", &self.system.kernel)?;
-        self.card_line(
-            conn,
-            1110,
-            "ROOTFS",
-            &format!("ALPINE {}", self.system.alpine),
-        )?;
-        self.card_line(conn, 1275, "MEMORY", &self.system.memory)?;
-        self.card_line(
-            conn,
-            1440,
-            "DISPLAY",
-            &format!("{}X{} 120 HZ", self.width, self.height),
-        )?;
-        self.card_line(conn, 1605, "WINDOW MANAGER", "A26 SHELL RUST")?;
-        self.card_line(conn, 1770, "CONTROL", "ADB UNIX SOCKET")?;
-        self.center_text(conn, "SWIPE UP FROM BELOW TO CLOSE", 2150, 4, MUTED)?;
-        self.home_bar(conn)?;
-        Ok(())
-    }
-
-    fn metric_card<C: Connection>(
-        &self,
-        conn: &C,
-        position: (i16, i16),
-        noun: &str,
-        value: &str,
-        color: u32,
-    ) -> Result<(), Box<dyn Error>> {
-        let (x, y) = position;
-        self.fill(
-            conn,
-            BG_CARD,
-            Rectangle {
-                x,
-                y,
-                width: 470,
-                height: 145,
-            },
-        )?;
-        self.text(conn, noun, x + 28, y + 24, 3, MUTED)?;
-        let clipped: String = value.chars().take(12).collect();
-        self.text(conn, &clipped, x + 28, y + 73, 6, color)?;
-        Ok(())
-    }
-
-    fn card_line<C: Connection>(
-        &self,
-        conn: &C,
-        y: i16,
-        noun: &str,
-        value: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        self.fill(
-            conn,
-            BG_CARD,
-            Rectangle {
-                x: 55,
-                y,
-                width: self.width - 110,
-                height: 145,
-            },
-        )?;
-        self.text(conn, noun, 85, y + 25, 4, MUTED)?;
-        let clipped: String = value.chars().take(28).collect();
-        self.text(conn, &clipped, 85, y + 78, 4, FG)?;
-        Ok(())
-    }
-
     fn render_volume<C: Connection>(&self, conn: &C, volume: u8) -> Result<(), Box<dyn Error>> {
         self.fill(
             conn,
@@ -431,32 +213,33 @@ impl Renderer {
     }
 
     fn system_icon<C: Connection>(&self, conn: &C, x: i16, y: i16) -> Result<(), Box<dyn Error>> {
-        conn.put_image(
-            ImageFormat::Z_PIXMAP,
-            self.window,
-            self.gc,
-            SYSTEM_ICON_SIZE,
-            SYSTEM_ICON_SIZE,
-            x,
-            y,
-            0,
-            24,
-            SYSTEM_ICON,
-        )?;
+        if let Some(icon) = self.system_icon.as_deref() {
+            conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                self.window,
+                self.gc,
+                SYSTEM_ICON_SIZE,
+                SYSTEM_ICON_SIZE,
+                x,
+                y,
+                0,
+                24,
+                icon,
+            )?;
+        } else {
+            self.fill(
+                conn,
+                BG_CARD,
+                Rectangle {
+                    x,
+                    y,
+                    width: SYSTEM_ICON_SIZE,
+                    height: SYSTEM_ICON_SIZE,
+                },
+            )?;
+            self.centered_in(conn, "SYS", (x, y + 72, SYSTEM_ICON_SIZE), 10, FG)?;
+        }
         Ok(())
-    }
-
-    fn home_bar<C: Connection>(&self, conn: &C) -> Result<(), Box<dyn Error>> {
-        self.fill(
-            conn,
-            FG,
-            Rectangle {
-                x: (self.width / 2 - 145) as i16,
-                y: (self.height - 55) as i16,
-                width: 290,
-                height: 14,
-            },
-        )
     }
 
     fn key_button<C: Connection>(
@@ -615,27 +398,4 @@ fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
 
 fn inside_button(x: i16, y: i16, cx: i16, cy: i16) -> bool {
     (i32::from(x) - i32::from(cx)).abs() <= 120 && (i32::from(y) - i32::from(cy)).abs() <= 120
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cpu_usage_uses_busy_delta() {
-        let previous = CpuTimes {
-            total: 1_000,
-            idle: 700,
-        };
-        let current = CpuTimes {
-            total: 1_200,
-            idle: 780,
-        };
-        assert_eq!(cpu_usage(previous, current), Some(60));
-    }
-
-    #[test]
-    fn storage_size_is_human_readable() {
-        assert_eq!(format_bytes(16 * 1024 * 1024 * 1024), "16.0 GB");
-    }
 }

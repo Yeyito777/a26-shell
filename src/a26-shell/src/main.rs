@@ -8,6 +8,7 @@ mod ui;
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
 const KEY_VOLUME_DOWN: u8 = 122;
 const KEY_VOLUME_UP: u8 = 123;
+const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
 
 #[derive(Default)]
 struct RawTouchTracker {
@@ -135,12 +137,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     conn.flush()?;
 
-    let mut renderer = Renderer {
+    let renderer = Renderer {
         window: shell_window,
         gc,
         width,
         height,
-        system: ui::SystemInfo::collect(),
+        system_icon: ui::load_system_icon(),
     };
     let ipc = IpcServer::bind(&config.socket_path)?;
     let mut state = ShellState::new(config.start_locked, config.initial_volume);
@@ -163,7 +165,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut hardware_awake = true;
     let mut raw_touch = RawTouchTracker::default();
-    let mut next_system_refresh = Instant::now();
+    let mut system_app: Option<Child> = None;
     renderer.render(&conn, &state)?;
     if let Some(device) = backlight.as_ref() {
         if let Err(error) = device.on() {
@@ -216,13 +218,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        reconcile_system_app(&mut state, &mut system_app);
         state.tick();
-        let now = Instant::now();
-        if state.view == View::System && now >= next_system_refresh {
-            renderer.refresh_system();
-            state.redraw = true;
-            next_system_refresh = now + Duration::from_secs(1);
-        }
         if state.screen_awake != hardware_awake {
             // Draw the safe frame before changing brightness. During wake the
             // lock screen is therefore complete before the panel lights up.
@@ -242,10 +239,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             hardware_awake = state.screen_awake;
         }
         if state.redraw {
-            raise_shell(&conn, shell_window)?;
-            renderer.render(&conn, &state)?;
+            if state.view != View::System {
+                raise_shell(&conn, shell_window)?;
+                renderer.render(&conn, &state)?;
+            }
             state.redraw = false;
         }
+        // External-app MapRequest/configure operations may be the only X11
+        // traffic in this state, so they cannot rely on a shell repaint to
+        // flush the connection.
+        conn.flush()?;
         thread::sleep(Duration::from_millis(8));
     }
 
@@ -258,6 +261,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _ = device.on();
         }
     }
+    stop_system_app(&mut system_app);
     let _ = conn.destroy_window(shell_window);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
@@ -342,13 +346,22 @@ fn handle_x_event(
                 }
                 state.last_action = "map_external_window".into();
                 state.redraw = true;
-                raise_shell(conn, shell_window)?;
+                if state.view == View::System {
+                    fullscreen_window(conn, event.window, width, height)?;
+                    conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
+                } else {
+                    raise_shell(conn, shell_window)?;
+                }
             }
         }
         Event::ConfigureRequest(event) => {
-            let aux = ConfigureWindowAux::from_configure_request(&event);
-            conn.configure_window(event.window, &aux)?;
-            raise_shell(conn, shell_window)?;
+            if state.view == View::System && state.managed_windows.contains(&event.window) {
+                fullscreen_window(conn, event.window, width, height)?;
+            } else {
+                let aux = ConfigureWindowAux::from_configure_request(&event);
+                conn.configure_window(event.window, &aux)?;
+                raise_shell(conn, shell_window)?;
+            }
         }
         Event::DestroyNotify(event) => {
             state
@@ -389,6 +402,83 @@ fn raise_shell(conn: &RustConnection, shell_window: u32) -> Result<(), Box<dyn E
         &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
     )?;
     Ok(())
+}
+
+fn fullscreen_window(
+    conn: &RustConnection,
+    window: u32,
+    width: u16,
+    height: u16,
+) -> Result<(), Box<dyn Error>> {
+    conn.configure_window(
+        window,
+        &ConfigureWindowAux::new()
+            .x(0)
+            .y(0)
+            .width(u32::from(width))
+            .height(u32::from(height))
+            .border_width(0)
+            .stack_mode(StackMode::ABOVE),
+    )?;
+    Ok(())
+}
+
+fn reconcile_system_app(state: &mut ShellState, child: &mut Option<Child>) {
+    if state.view != View::System {
+        stop_system_app(child);
+        return;
+    }
+
+    if let Some(process) = child.as_mut() {
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("a26-system exited with {status}");
+                *child = None;
+                state.home();
+                state.last_action = "system_process_exited".into();
+            }
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("cannot inspect a26-system: {error}");
+                stop_system_app(child);
+                state.home();
+                state.last_action = "system_process_error".into();
+            }
+        }
+    }
+
+    if state.view != View::System || child.is_some() {
+        return;
+    }
+    let executable = env::var_os("A26_SYSTEM_APP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_SYSTEM_APP.into());
+    match ProcessCommand::new(&executable)
+        .env(
+            "DISPLAY",
+            env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
+        )
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(process) => {
+            eprintln!("started a26-system pid={}", process.id());
+            *child = Some(process);
+            state.last_action = "system_process_started".into();
+        }
+        Err(error) => {
+            eprintln!("cannot start {}: {error}", executable.display());
+            state.home();
+            state.last_action = "system_launch_failed".into();
+        }
+    }
+}
+
+fn stop_system_app(child: &mut Option<Child>) {
+    if let Some(mut process) = child.take() {
+        let _ = process.kill();
+        let _ = process.wait();
+    }
 }
 
 fn pointer_begin(state: &mut ShellState, x: i16, y: i16) {

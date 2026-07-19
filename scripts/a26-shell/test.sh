@@ -47,6 +47,20 @@ state="$($CTL state)"
 [[ "$(field view <<<"$state")" == system ]]
 [[ "$(field current_app <<<"$state")" == System ]]
 
+# The System scene must be a separately managed process/window, not an
+# in-process shell renderer.
+external_ready=0
+for _ in $(seq 1 50); do
+    app_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')"
+    app_window="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -name a26-system 2>/dev/null || true'\''"' | tr -d '\r')"
+    if [[ -n "$app_pid" ]] && grep -q 'Map State: IsViewable' <<<"$app_window"; then
+        external_ready=1
+        break
+    fi
+    sleep 0.1
+done
+[[ "$external_ready" == 1 ]]
+
 # Reproduce the physical bottom-edge gesture through the same reducer path.
 "$CTL" pointer-begin 540 2290 >/dev/null
 "$CTL" pointer-move 540 1810 >/dev/null
@@ -54,6 +68,12 @@ state="$($CTL state)"
 state="$($CTL state)"
 [[ "$(field view <<<"$state")" == launcher ]]
 [[ "$(field last_action <<<"$state")" == swipe_up_close ]]
+for _ in $(seq 1 50); do
+    app_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')"
+    [[ -z "$app_pid" ]] && break
+    sleep 0.1
+done
+[[ -z "$app_pid" ]]
 
 before="$(field volume <<<"$state")"
 "$CTL" volume up >/dev/null

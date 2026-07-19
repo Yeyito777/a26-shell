@@ -15,6 +15,8 @@ PASS: System scene retains its bottom gesture bar
 PASS: power screen-off/on policy still locks before wake
 PASS: System scene displays live CPU and Mali GPU utilization
 PASS: System scene displays used and remaining root-filesystem space
+PASS: System is a normal, separately managed X11 process/window
+PASS: bottom swipe and power lock terminate the external app process
 
 Screenshots:
   notes/a26-shell/launcher-redesign.png

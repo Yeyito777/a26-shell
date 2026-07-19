@@ -1,24 +1,28 @@
 # a26-shell
 
 `a26-shell` is the first native phone shell/window manager for the Galaxy A26
-research target. It is intentionally self-contained and toolkit-free. X11
-protocol work uses pure-Rust `x11rb`; drawing uses X11 rectangles and an
-embedded bitmap font.
+research target. Its core UI is toolkit-free: X11 protocol work uses pure-Rust
+`x11rb`, and drawing uses X11 rectangles and an embedded bitmap font. Apps are
+separate managed processes maintained in their own repositories.
 
 Current features:
 
 - fullscreen numeric lock screen;
 - salted, hashed six-digit PIN configuration (no plaintext PIN in source);
 - touch-first launcher containing the **System** app;
-- generated System app artwork with a one-pixel launcher frame;
-- built-in System information view;
-- live CPU/GPU utilization and used/remaining filesystem space;
+- app-provided System artwork with a one-pixel launcher frame;
+- external `a26-system` process launch and fullscreen lifecycle management;
 - bottom-edge swipe-up app close gesture;
 - volume-key handling and volume overlay;
 - physical power-key lock/screen blanking with panel-backlight control;
 - ordinary X11 `MapRequest`/`ConfigureRequest` handling;
 - root-only Unix-socket IPC for state inspection and deterministic input;
 - host-side build/install/test scripts over ADB.
+
+The standalone System app lives at
+<https://github.com/Yeyito777/a26-system>. It installs its executable and icon
+under `/opt/a26-system`; the shell does not contain the System renderer or
+telemetry implementation.
 
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by

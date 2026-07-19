@@ -7,7 +7,6 @@ IMAGE="$PROJECT_ROOT/images/a26-shell-0.1.0"
 TARGET=aarch64-unknown-linux-musl
 
 rustup target add "$TARGET" >/dev/null
-"$PROJECT_ROOT/scripts/a26-shell/prepare-assets.py"
 # Cargo only discovers .cargo/config.toml by walking up from its current
 # directory (not from --manifest-path), so build from the source directory to
 # select the musl cross-linker pinned there.
