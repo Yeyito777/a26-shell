@@ -37,6 +37,7 @@ const KEY_VOLUME_UP: u8 = 123;
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
 const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
+const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 
 #[derive(Default)]
 struct RawTouchTracker {
@@ -167,6 +168,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         initial_status.wifi_connected,
     );
     let mut next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
+    let mut next_launch_animation = Instant::now();
     let mut power_key = match PowerKey::open("/dev/input/event1") {
         Ok(device) => {
             eprintln!("physical power key ready at /dev/input/event1");
@@ -254,10 +256,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         reconcile_apps(&mut state, &mut system_app, &mut browser_app);
+        if state.app_ready_to_reveal() {
+            let app_window = state.managed_windows.first().copied();
+            state.finish_app_launch();
+            if let Some(window) = app_window {
+                fullscreen_window(&conn, window, width, height)?;
+                conn.set_input_focus(InputFocus::PARENT, window, CURRENT_TIME)?;
+            }
+        }
         if Instant::now() >= next_device_status {
             let device_status = status::DeviceStatus::read();
             state.update_device_status(device_status.battery_percent, device_status.wifi_connected);
             next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
+        }
+        if state.app_launching() && Instant::now() >= next_launch_animation {
+            state.redraw = true;
+            next_launch_animation = Instant::now() + LAUNCH_ANIMATION_INTERVAL;
         }
         state.tick();
         if state.screen_awake != hardware_awake {
@@ -293,7 +307,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             hardware_awake = state.screen_awake;
         }
         if state.redraw {
-            if !state.view.is_app() {
+            if !state.view.is_app() || state.app_launching() {
                 raise_shell(&conn, shell_window)?;
                 renderer.render(&conn, &state)?;
             }
@@ -427,7 +441,12 @@ fn handle_x_event(
                 state.redraw = true;
                 if state.view.is_app() {
                     fullscreen_window(conn, event.window, width, height)?;
-                    conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
+                    if state.app_launching() {
+                        state.note_app_window_mapped();
+                        raise_shell(conn, shell_window)?;
+                    } else {
+                        conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
+                    }
                 } else {
                     raise_shell(conn, shell_window)?;
                 }
@@ -436,6 +455,9 @@ fn handle_x_event(
         Event::ConfigureRequest(event) => {
             if state.view.is_app() && state.managed_windows.contains(&event.window) {
                 fullscreen_window(conn, event.window, width, height)?;
+                if state.app_launching() {
+                    raise_shell(conn, shell_window)?;
+                }
             } else {
                 let aux = ConfigureWindowAux::from_configure_request(&event);
                 conn.configure_window(event.window, &aux)?;

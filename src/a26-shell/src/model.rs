@@ -45,6 +45,8 @@ pub struct ShellState {
     pub redraw: bool,
     pub should_exit: bool,
     pub managed_windows: Vec<u32>,
+    app_launch_started: Option<Instant>,
+    app_window_mapped_at: Option<Instant>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +67,7 @@ pub struct PublicState {
     pub last_action: String,
     pub pointer_active: bool,
     pub managed_windows: Vec<u32>,
+    pub app_launching: bool,
 }
 
 impl ShellState {
@@ -88,6 +91,8 @@ impl ShellState {
             redraw: true,
             should_exit: false,
             managed_windows: Vec::new(),
+            app_launch_started: None,
+            app_window_mapped_at: None,
         }
     }
 
@@ -117,6 +122,7 @@ impl ShellState {
             last_action: self.last_action.clone(),
             pointer_active: self.pointer.is_some(),
             managed_windows: self.managed_windows.clone(),
+            app_launching: self.app_launching(),
         }
     }
 
@@ -124,6 +130,7 @@ impl ShellState {
         self.view = View::Locked;
         self.clear_pin();
         self.pointer = None;
+        self.cancel_app_launch();
         self.last_action = "lock".into();
         self.redraw = true;
     }
@@ -151,22 +158,25 @@ impl ShellState {
     pub fn home(&mut self) {
         if self.screen_awake && self.view != View::Locked {
             self.view = View::Launcher;
+            self.cancel_app_launch();
             self.last_action = "home".into();
             self.redraw = true;
         }
     }
 
     pub fn launch_system(&mut self) {
-        if self.screen_awake && self.view != View::Locked {
+        if self.screen_awake && self.view != View::Locked && self.view != View::System {
             self.view = View::System;
+            self.begin_app_launch();
             self.last_action = "launch_system".into();
             self.redraw = true;
         }
     }
 
     pub fn launch_browser(&mut self) {
-        if self.screen_awake && self.view != View::Locked {
+        if self.screen_awake && self.view != View::Locked && self.view != View::Browser {
             self.view = View::Browser;
+            self.begin_app_launch();
             self.last_action = "launch_browser".into();
             self.redraw = true;
         }
@@ -261,6 +271,67 @@ impl ShellState {
         }
     }
 
+    pub fn app_launching(&self) -> bool {
+        self.view.is_app() && self.app_launch_started.is_some()
+    }
+
+    pub fn app_launch_elapsed(&self) -> Duration {
+        self.app_launch_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub fn note_app_window_mapped(&mut self) {
+        if self.app_launching() && self.app_window_mapped_at.is_none() {
+            self.app_window_mapped_at = Some(Instant::now());
+            self.last_action = match self.view {
+                View::System => "system_window_warming",
+                View::Browser => "browser_window_warming",
+                View::Locked | View::Launcher => return,
+            }
+            .into();
+            self.redraw = true;
+        }
+    }
+
+    pub fn app_ready_to_reveal(&self) -> bool {
+        let Some(mapped_at) = self.app_window_mapped_at else {
+            return false;
+        };
+        let settle_time = match self.view {
+            View::System => Duration::from_millis(180),
+            View::Browser => Duration::from_millis(1500),
+            View::Locked | View::Launcher => return false,
+        };
+        mapped_at.elapsed() >= settle_time
+    }
+
+    pub fn finish_app_launch(&mut self) {
+        if !self.app_launching() {
+            return;
+        }
+        self.app_launch_started = None;
+        self.app_window_mapped_at = None;
+        self.last_action = match self.view {
+            View::System => "system_ready",
+            View::Browser => "browser_ready",
+            View::Locked | View::Launcher => return,
+        }
+        .into();
+        self.redraw = true;
+    }
+
+    fn begin_app_launch(&mut self) {
+        self.managed_windows.clear();
+        self.app_launch_started = Some(Instant::now());
+        self.app_window_mapped_at = None;
+    }
+
+    fn cancel_app_launch(&mut self) {
+        self.app_launch_started = None;
+        self.app_window_mapped_at = None;
+    }
+
     pub fn tick(&mut self) {
         let _ = self.is_lockout_active();
         if self
@@ -352,5 +423,12 @@ mod tests {
         assert_eq!(state.view, View::Browser);
         assert_eq!(state.public(1080, 2340).current_app, Some("Browser"));
         assert!(state.view.is_app());
+        assert!(state.app_launching());
+
+        state.note_app_window_mapped();
+        state.app_window_mapped_at = Some(Instant::now() - Duration::from_secs(2));
+        assert!(state.app_ready_to_reveal());
+        state.finish_app_launch();
+        assert!(!state.app_launching());
     }
 }

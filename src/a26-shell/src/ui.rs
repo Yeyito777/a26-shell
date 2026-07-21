@@ -68,6 +68,9 @@ impl Renderer {
         match state.view {
             View::Locked => self.render_lock(conn, state)?,
             View::Launcher => self.render_launcher(conn, state)?,
+            View::System | View::Browser if state.app_launching() => {
+                self.render_app_launch(conn, state)?
+            }
             View::System | View::Browser => {}
         }
         if state
@@ -200,6 +203,49 @@ impl Renderer {
             1,
         )?;
         self.centered_in(conn, "BROWSER", (380, 512, APP_ICON_SIZE), 5, FG)?;
+        Ok(())
+    }
+
+    fn render_app_launch<C: Connection>(
+        &self,
+        conn: &C,
+        state: &ShellState,
+    ) -> Result<(), Box<dyn Error>> {
+        let (name, icon, fallback, accent) = match state.view {
+            View::System => ("SYSTEM", self.system_icon.as_deref(), "SYS", ACCENT_2),
+            View::Browser => ("BROWSER", self.browser_icon.as_deref(), "WEB", ACCENT),
+            View::Locked | View::Launcher => return Ok(()),
+        };
+        let icon_x = self.width.saturating_sub(APP_ICON_SIZE) / 2;
+        let icon_y = 720_i16;
+        self.app_icon(conn, icon, icon_x as i16, icon_y, fallback)?;
+        self.outline(
+            conn,
+            accent,
+            Rectangle {
+                x: icon_x.saturating_sub(1) as i16,
+                y: icon_y - 1,
+                width: APP_ICON_SIZE + 2,
+                height: APP_ICON_SIZE + 2,
+            },
+            1,
+        )?;
+        self.center_text(conn, &format!("OPENING {name}"), 1010, 6, FG)?;
+        self.center_text(conn, "PLEASE WAIT", 1100, 4, MUTED)?;
+
+        let active = (state.app_launch_elapsed().as_millis() / 180 % 3) as i16;
+        for index in 0_i16..3 {
+            self.fill(
+                conn,
+                if index == active { accent } else { BG_CARD },
+                Rectangle {
+                    x: 478 + index * 50,
+                    y: 1190,
+                    width: 28,
+                    height: 8,
+                },
+            )?;
+        }
         Ok(())
     }
 
