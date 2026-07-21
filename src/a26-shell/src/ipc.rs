@@ -6,6 +6,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::keyboard::KeyboardPurpose;
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Ping,
@@ -21,6 +23,8 @@ pub enum Command {
     Home,
     LaunchSystem,
     LaunchBrowser,
+    KeyboardShow(KeyboardPurpose),
+    KeyboardHide,
     SwipeUp,
     VolumeUp,
     VolumeDown,
@@ -165,6 +169,20 @@ fn parse_command(line: &str) -> Result<Command, String> {
             Some(_) => return Err("app must be System or Browser".into()),
             None => return Err("missing app noun".into()),
         },
+        "keyboard" => match parts.next() {
+            Some("show") => {
+                let purpose = parts
+                    .next()
+                    .and_then(KeyboardPurpose::parse)
+                    .ok_or_else(|| {
+                        "keyboard show requires text, url, search, password, or number".to_string()
+                    })?;
+                Command::KeyboardShow(purpose)
+            }
+            Some("hide") => Command::KeyboardHide,
+            Some(_) => return Err("keyboard requires show or hide".into()),
+            None => return Err("keyboard requires show or hide".into()),
+        },
         "volume" => match parts.next() {
             Some("up") => Command::VolumeUp,
             Some("down") => Command::VolumeDown,
@@ -186,4 +204,23 @@ fn parse_command(line: &str) -> Result<Command, String> {
     };
     no_extra(parts)?;
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_keyboard_commands_without_a_second_protocol() {
+        assert!(matches!(
+            parse_command("keyboard show url"),
+            Ok(Command::KeyboardShow(KeyboardPurpose::Url))
+        ));
+        assert!(matches!(
+            parse_command("keyboard hide"),
+            Ok(Command::KeyboardHide)
+        ));
+        assert!(parse_command("keyboard show secret").is_err());
+        assert!(parse_command("keyboard show password extra").is_err());
+    }
 }

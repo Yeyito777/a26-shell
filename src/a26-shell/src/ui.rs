@@ -10,12 +10,12 @@ use x11rb::protocol::xproto::{
 use crate::font;
 use crate::model::{ShellState, View};
 
-const BG: u32 = 0x0b1020;
-const BG_CARD: u32 = 0x182235;
-const FG: u32 = 0xf5f7fb;
-const MUTED: u32 = 0x94a3b8;
-const ACCENT: u32 = 0x5eead4;
-const ACCENT_2: u32 = 0x60a5fa;
+pub(crate) const BG: u32 = 0x0b1020;
+pub(crate) const BG_CARD: u32 = 0x182235;
+pub(crate) const FG: u32 = 0xf5f7fb;
+pub(crate) const MUTED: u32 = 0x94a3b8;
+pub(crate) const ACCENT: u32 = 0x5eead4;
+pub(crate) const ACCENT_2: u32 = 0x60a5fa;
 const DANGER: u32 = 0xfb7185;
 const APP_ICON_SIZE: u16 = 220;
 const APP_ICON_BYTES: usize = APP_ICON_SIZE as usize * APP_ICON_SIZE as usize * 4;

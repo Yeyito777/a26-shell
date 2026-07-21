@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, MapState};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let output = std::env::args()
@@ -12,11 +12,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (conn, screen_number) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_number];
     let tree = conn.query_tree(screen.root)?.reply()?;
-    let window = tree
-        .children
-        .last()
-        .copied()
-        .ok_or("the X root has no child window")?;
+    // Root children are returned bottom-to-top. Keyboard and app windows stay
+    // allocated when hidden, so choosing the last child can target an unmapped
+    // window and fail with BadMatch. Capture the topmost viewable surface.
+    let mut window = None;
+    for candidate in tree.children.iter().rev().copied() {
+        if conn.get_window_attributes(candidate)?.reply()?.map_state == MapState::VIEWABLE {
+            window = Some(candidate);
+            break;
+        }
+    }
+    let window = window.ok_or("the X root has no viewable child window")?;
     let geometry = conn.get_geometry(window)?.reply()?;
     let image = conn
         .get_image(

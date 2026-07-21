@@ -2,6 +2,7 @@ mod config;
 mod font;
 mod input;
 mod ipc;
+mod keyboard;
 mod model;
 mod status;
 mod ui;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use config::Config;
 use input::{Backlight, PowerKey, TouchscreenPower};
 use ipc::{Command, IpcServer};
+use keyboard::{KeyboardEffect, KeyboardGeometry, KeyboardSurface, XtestInjector};
 use model::{PointerGesture, ShellState, View};
 use ui::{KeypadAction, Renderer};
 use x11rb::connection::Connection;
@@ -23,11 +25,11 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, Blanking, ButtonPressEvent,
-    ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux,
-    CreateWindowAux, EventMask, Exposures, GrabMode, InputFocus, KeyButMask, ModMask, PropMode,
-    StackMode, WindowClass,
+    AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, Blanking, ChangeWindowAttributesAux,
+    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Exposures,
+    GrabMode, InputFocus, MOTION_NOTIFY_EVENT, ModMask, PropMode, StackMode, WindowClass,
 };
+use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
@@ -75,6 +77,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     conn.xfixes_query_version(4, 0)?.reply()?;
+    let mut key_injector = XtestInjector::query(
+        &conn,
+        root,
+        conn.setup().min_keycode,
+        conn.setup().max_keycode,
+    )?;
     // A direct PMIC power-key read is invisible to the X server. Disable Xorg's
     // independent blanking/DPMS timers so it cannot blank while our shell still
     // believes the screen is awake (volume keys previously appeared to be the
@@ -143,8 +151,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, shell_window, &CreateGCAux::new().graphics_exposures(0))?;
+    let keyboard_geometry = KeyboardGeometry::new(width, height);
+    let mut keyboard_surface =
+        KeyboardSurface::create(&conn, root, screen.root_depth, keyboard_geometry)?;
     conn.map_window(shell_window)?;
     conn.xfixes_hide_cursor(shell_window)?.check()?;
+    conn.xfixes_hide_cursor(keyboard_surface.window)?.check()?;
     raise_shell(&conn, shell_window)?;
     conn.set_input_focus(InputFocus::PARENT, shell_window, CURRENT_TIME)?;
     for keycode in [KEY_VOLUME_DOWN, KEY_VOLUME_UP] {
@@ -206,6 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut raw_touch = RawTouchTracker::default();
     let mut system_app: Option<Child> = None;
     let mut browser_app: Option<Child> = None;
+    let mut app_viewport: Option<(u32, u16)> = None;
     renderer.render(&conn, &state)?;
     if let Some(device) = touchscreen.as_ref()
         && let Err(error) = device.on()
@@ -232,10 +245,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 event,
                 root,
                 shell_window,
+                keyboard_surface.window,
                 (width, height),
+                &keyboard_geometry,
                 &config,
                 &mut state,
                 &mut raw_touch,
+                &mut key_injector,
             )?;
         }
 
@@ -256,7 +272,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (stream, request) in ipc.accept_all() {
             match request {
                 Ok(command) => {
-                    apply_command(&conn, root, command, width, height, &config, &mut state);
+                    apply_command(
+                        &conn,
+                        root,
+                        command,
+                        width,
+                        height,
+                        &keyboard_geometry,
+                        &config,
+                        &mut state,
+                        &key_injector,
+                    );
                     let public = state.public(width, height);
                     ipc::respond(stream, Ok(&public));
                 }
@@ -273,6 +299,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                 conn.set_input_focus(InputFocus::PARENT, window, CURRENT_TIME)?;
             }
         }
+        let keyboard_app_window =
+            if state.screen_awake && state.view.is_app() && !state.app_launching() {
+                state.managed_windows.first().copied()
+            } else {
+                None
+            };
+        let desired_viewport = keyboard_app_window.map(|window| {
+            (
+                window,
+                if state.keyboard.is_visible() {
+                    keyboard_geometry.app_height()
+                } else {
+                    height
+                },
+            )
+        });
+        if desired_viewport != app_viewport {
+            if let Some((window, app_height)) = desired_viewport {
+                resize_app_window(&conn, window, width, app_height)?;
+                if state.keyboard.is_visible() {
+                    state.keyboard.request_raise();
+                }
+            }
+            app_viewport = desired_viewport;
+        }
+        keyboard_surface.sync(&conn, &mut state.keyboard, keyboard_app_window)?;
         if Instant::now() >= next_device_status {
             let device_status = status::DeviceStatus::read();
             state.update_device_status(device_status.battery_percent, device_status.wifi_connected);
@@ -344,6 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     stop_system_app(&mut system_app);
     stop_system_app(&mut browser_app);
     let _ = conn.destroy_window(shell_window);
+    keyboard_surface.destroy(&conn);
     let _ = conn.free_pixmap(shell_back_buffer);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
@@ -375,10 +428,13 @@ fn handle_x_event(
     event: Event,
     root: u32,
     shell_window: u32,
+    keyboard_window: u32,
     dimensions: (u16, u16),
+    keyboard_geometry: &KeyboardGeometry,
     config: &Config,
     state: &mut ShellState,
     raw_touch: &mut RawTouchTracker,
+    key_injector: &mut XtestInjector,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height) = dimensions;
     match event {
@@ -390,7 +446,7 @@ fn handle_x_event(
                     raw_touch.touch_id = Some(event.detail);
                     raw_touch.x = x;
                     raw_touch.y = y;
-                    pointer_begin(state, x, y);
+                    pointer_begin(state, keyboard_geometry, x, y);
                 }
             }
         }
@@ -412,13 +468,18 @@ fn handle_x_event(
                 raw_touch.y,
                 width,
                 height,
+                keyboard_geometry,
                 config,
+                key_injector,
             );
             raw_touch.touch_id = None;
         }
         Event::Expose(event) if event.window == shell_window => state.redraw = true,
+        Event::Expose(event) if event.window == keyboard_window => {
+            state.keyboard.request_redraw();
+        }
         Event::ButtonPress(event) if event.event == shell_window => {
-            pointer_begin(state, event.event_x, event.event_y);
+            pointer_begin(state, keyboard_geometry, event.event_x, event.event_y);
         }
         Event::MotionNotify(event) if event.event == shell_window => {
             pointer_move(state, event.event_x, event.event_y);
@@ -432,7 +493,9 @@ fn handle_x_event(
                 event.event_y,
                 width,
                 height,
+                keyboard_geometry,
                 config,
+                key_injector,
             );
         }
         Event::KeyPress(event) => match event.detail {
@@ -441,22 +504,31 @@ fn handle_x_event(
             _ => {}
         },
         Event::MapRequest(event) => {
-            if event.window != shell_window {
+            if event.window != shell_window && event.window != keyboard_window {
                 conn.map_window(event.window)?;
                 conn.xfixes_hide_cursor(event.window)?.check()?;
                 if !state.managed_windows.contains(&event.window) {
                     state.managed_windows.push(event.window);
                 }
+                let is_primary = state.managed_windows.first().copied() == Some(event.window);
                 state.last_action = "map_external_window".into();
                 state.redraw = true;
                 if state.view.is_app() {
-                    fullscreen_window(conn, event.window, width, height)?;
-                    if state.app_launching() {
-                        state.note_app_window_mapped();
-                        raise_shell(conn, shell_window)?;
+                    let app_height = if is_primary && state.keyboard.is_visible() {
+                        keyboard_geometry.app_height()
                     } else {
+                        height
+                    };
+                    fullscreen_window(conn, event.window, width, app_height)?;
+                    if state.app_launching() {
+                        if is_primary {
+                            state.note_app_window_mapped();
+                        }
+                        raise_shell(conn, shell_window)?;
+                    } else if is_primary {
                         conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
                     }
+                    state.keyboard.request_raise();
                 } else {
                     raise_shell(conn, shell_window)?;
                 }
@@ -464,7 +536,13 @@ fn handle_x_event(
         }
         Event::ConfigureRequest(event) => {
             if state.view.is_app() && state.managed_windows.contains(&event.window) {
-                fullscreen_window(conn, event.window, width, height)?;
+                let is_primary = state.managed_windows.first().copied() == Some(event.window);
+                if is_primary && state.keyboard.is_visible() {
+                    resize_app_window(conn, event.window, width, keyboard_geometry.app_height())?;
+                } else {
+                    fullscreen_window(conn, event.window, width, height)?;
+                }
+                state.keyboard.request_raise();
                 if state.app_launching() {
                     raise_shell(conn, shell_window)?;
                 }
@@ -474,20 +552,35 @@ fn handle_x_event(
                 // Browser engines create auxiliary clipboard, selection, and
                 // popup windows. Their configure requests must not raise the
                 // shell over the application's primary window.
-                if !state.view.is_app() {
+                if state.view.is_app() {
+                    state.keyboard.request_raise();
+                } else {
                     raise_shell(conn, shell_window)?;
                 }
             }
         }
+        Event::MapNotify(event)
+            if event.window != shell_window && event.window != keyboard_window =>
+        {
+            state.keyboard.request_raise();
+        }
+        Event::ConfigureNotify(event)
+            if event.window != shell_window && event.window != keyboard_window =>
+        {
+            state.keyboard.request_raise();
+        }
         Event::DestroyNotify(event) => {
-            state
-                .managed_windows
-                .retain(|window| *window != event.window);
+            state.note_managed_window_closed(event.window);
         }
         Event::UnmapNotify(event) => {
-            state
-                .managed_windows
-                .retain(|window| *window != event.window);
+            if event.window != keyboard_window {
+                state.note_managed_window_closed(event.window);
+            }
+        }
+        Event::MappingNotify(_) => {
+            if let Err(error) = key_injector.refresh(conn) {
+                eprintln!("cannot refresh X keyboard mapping: {error}");
+            }
         }
         _ => {}
     }
@@ -535,6 +628,24 @@ fn fullscreen_window(
             .height(u32::from(height))
             .border_width(0)
             .stack_mode(StackMode::ABOVE),
+    )?;
+    Ok(())
+}
+
+fn resize_app_window(
+    conn: &RustConnection,
+    window: u32,
+    width: u16,
+    height: u16,
+) -> Result<(), Box<dyn Error>> {
+    conn.configure_window(
+        window,
+        &ConfigureWindowAux::new()
+            .x(0)
+            .y(0)
+            .width(u32::from(width))
+            .height(u32::from(height.max(1)))
+            .border_width(0),
     )?;
     Ok(())
 }
@@ -621,16 +732,20 @@ fn stop_system_app(child: &mut Option<Child>) {
     }
 }
 
-fn pointer_begin(state: &mut ShellState, x: i16, y: i16) {
+fn pointer_begin(state: &mut ShellState, keyboard_geometry: &KeyboardGeometry, x: i16, y: i16) {
     if !state.screen_awake {
         return;
     }
+    let keyboard_owned = keyboard_geometry.owns_touch(&state.keyboard, x, y);
+    let keyboard_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
     state.pointer = Some(PointerGesture {
         start_x: x,
         start_y: y,
         last_x: x,
         last_y: y,
         started: Instant::now(),
+        keyboard_owned,
+        keyboard_key_index,
     });
     state.last_action = "pointer_begin".into();
 }
@@ -651,7 +766,9 @@ fn pointer_end(
     y: i16,
     width: u16,
     height: u16,
+    keyboard_geometry: &KeyboardGeometry,
     config: &Config,
+    key_injector: &XtestInjector,
 ) {
     let Some(mut pointer) = state.pointer.take() else {
         return;
@@ -661,6 +778,25 @@ fn pointer_end(
     let dx = i32::from(pointer.last_x) - i32::from(pointer.start_x);
     let dy = i32::from(pointer.last_y) - i32::from(pointer.start_y);
     let elapsed = pointer.started.elapsed();
+    if pointer.keyboard_owned {
+        let end_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
+        if dx.abs() <= 60
+            && dy.abs() <= 60
+            && elapsed <= Duration::from_millis(850)
+            && pointer.keyboard_key_index == end_key_index
+        {
+            if let Some(index) = pointer.keyboard_key_index {
+                if let Some(key) = keyboard_geometry.keys(&state.keyboard).get(index) {
+                    handle_keyboard_action(conn, state, key.action, key_injector);
+                }
+            } else {
+                state.last_action = "keyboard_tap_between_keys".into();
+            }
+        } else {
+            state.last_action = "keyboard_gesture_cancel".into();
+        }
+        return;
+    }
     let upward = -dy;
     let bottom_start = i32::from(pointer.start_y) >= i32::from(height) - 180;
     let close_swipe = state.view.is_app()
@@ -675,13 +811,24 @@ fn pointer_end(
         return;
     }
     if dx.abs() <= 35 && dy.abs() <= 35 && elapsed <= Duration::from_millis(650) {
-        handle_tap(conn, root, state, x, y, width, config);
+        handle_tap(
+            conn,
+            root,
+            state,
+            x,
+            y,
+            width,
+            keyboard_geometry,
+            config,
+            key_injector,
+        );
     } else {
         state.last_action = "gesture_cancel".into();
     }
     state.redraw = true;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tap(
     conn: &RustConnection,
     root: u32,
@@ -689,8 +836,18 @@ fn handle_tap(
     x: i16,
     y: i16,
     width: u16,
+    keyboard_geometry: &KeyboardGeometry,
     config: &Config,
+    key_injector: &XtestInjector,
 ) {
+    if keyboard_geometry.owns_touch(&state.keyboard, x, y) {
+        if let Some(action) = keyboard_geometry.action_at(&state.keyboard, x, y) {
+            handle_keyboard_action(conn, state, action, key_injector);
+        } else {
+            state.last_action = "keyboard_tap_between_keys".into();
+        }
+        return;
+    }
     match state.view {
         View::Locked => match ui::keypad_action_at(width, x, y) {
             Some(KeypadAction::Digit(digit)) => state.input_digit(digit, config),
@@ -715,12 +872,12 @@ fn handle_tap(
             } else {
                 "browser"
             };
-            let Some(window) = state.managed_windows.first().copied() else {
+            let Some(_window) = state.managed_windows.first().copied() else {
                 state.last_action = format!("{app_name}_tap_no_window");
                 state.redraw = true;
                 return;
             };
-            match forward_tap(conn, root, window, x, y) {
+            match forward_tap(conn, root, x, y) {
                 Ok(()) => state.last_action = format!("{app_name}_tap_forwarded"),
                 Err(error) => {
                     eprintln!("cannot forward tap to {app_name}: {error}");
@@ -732,14 +889,59 @@ fn handle_tap(
     state.redraw = true;
 }
 
+fn handle_keyboard_action(
+    conn: &RustConnection,
+    state: &mut ShellState,
+    action: keyboard::KeyAction,
+    key_injector: &XtestInjector,
+) {
+    match state.activate_keyboard_key(action) {
+        KeyboardEffect::Inject(input) => {
+            let result = state
+                .managed_windows
+                .first()
+                .copied()
+                .ok_or_else(|| "active app window is unavailable".into())
+                .and_then(|primary| key_injector.inject(conn, input, primary));
+            if let Err(error) = result {
+                // Never include the character or key action in this diagnostic;
+                // password input is intentionally ephemeral and non-loggable.
+                eprintln!("keyboard input injection failed: {error}");
+                state.hide_keyboard();
+                state.last_action = "keyboard_input_failed".into();
+            }
+        }
+        KeyboardEffect::Hide => {
+            // Dismiss editing as well as the surface. This gives clients a
+            // focus transition, so tapping the same page field later can
+            // request the keyboard again instead of remaining silently focused.
+            let result = state
+                .managed_windows
+                .first()
+                .copied()
+                .ok_or_else(|| "active app window is unavailable".into())
+                .and_then(|primary| {
+                    key_injector.inject(conn, keyboard::KeyboardInput::Escape, primary)
+                });
+            if let Err(error) = result {
+                eprintln!("keyboard dismissal injection failed: {error}");
+            }
+        }
+        KeyboardEffect::None => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_command(
     conn: &RustConnection,
     root: u32,
     command: Command,
     width: u16,
     height: u16,
+    keyboard_geometry: &KeyboardGeometry,
     config: &Config,
     state: &mut ShellState,
+    key_injector: &XtestInjector,
 ) {
     match command {
         Command::Ping | Command::State => {}
@@ -748,14 +950,39 @@ fn apply_command(
         Command::Submit => {
             state.submit_pin(config);
         }
-        Command::Tap(x, y) => handle_tap(conn, root, state, x, y, width, config),
-        Command::PointerBegin(x, y) => pointer_begin(state, x, y),
+        Command::Tap(x, y) => handle_tap(
+            conn,
+            root,
+            state,
+            x,
+            y,
+            width,
+            keyboard_geometry,
+            config,
+            key_injector,
+        ),
+        Command::PointerBegin(x, y) => pointer_begin(state, keyboard_geometry, x, y),
         Command::PointerMove(x, y) => pointer_move(state, x, y),
-        Command::PointerEnd(x, y) => pointer_end(conn, root, state, x, y, width, height, config),
+        Command::PointerEnd(x, y) => pointer_end(
+            conn,
+            root,
+            state,
+            x,
+            y,
+            width,
+            height,
+            keyboard_geometry,
+            config,
+            key_injector,
+        ),
         Command::Lock => state.lock(),
         Command::Home => state.home(),
         Command::LaunchSystem => state.launch_system(),
         Command::LaunchBrowser => state.launch_browser(),
+        Command::KeyboardShow(purpose) => {
+            state.show_keyboard(purpose);
+        }
+        Command::KeyboardHide => state.hide_keyboard(),
         Command::SwipeUp => {
             if state.view.is_app() {
                 state.home();
@@ -772,32 +999,20 @@ fn apply_command(
     }
 }
 
-fn forward_tap(
-    conn: &RustConnection,
-    root: u32,
-    window: u32,
-    x: i16,
-    y: i16,
-) -> Result<(), Box<dyn Error>> {
+fn forward_tap(conn: &RustConnection, root: u32, x: i16, y: i16) -> Result<(), Box<dyn Error>> {
+    // Send through XTEST rather than constructing an event for the managed
+    // top-level. Chromium places its page surface in descendant X windows; a
+    // SendEvent aimed at the top-level never reaches the renderer and cannot
+    // establish page focus. XTEST performs normal server hit-testing at the
+    // physical coordinate, so native app controls and embedded page surfaces
+    // receive the same pointer sequence as a hardware tap.
+    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, CURRENT_TIME, root, x, y, 0)?
+        .check()?;
     for response_type in [BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT] {
-        let event = ButtonPressEvent {
-            response_type,
-            detail: 1,
-            sequence: 0,
-            time: CURRENT_TIME,
-            root,
-            event: window,
-            child: 0,
-            root_x: x,
-            root_y: y,
-            event_x: x,
-            event_y: y,
-            state: KeyButMask::default(),
-            same_screen: true,
-        };
-        conn.send_event(false, window, EventMask::NO_EVENT, event)?
+        conn.xtest_fake_input(response_type, 1, CURRENT_TIME, root, 0, 0, 0)?
             .check()?;
     }
+    conn.flush()?;
     Ok(())
 }
 

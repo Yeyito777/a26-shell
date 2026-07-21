@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use crate::config::Config;
+use crate::keyboard::{
+    KeyAction, KeyboardEffect, KeyboardPurpose, KeyboardState, PublicKeyboardState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +30,8 @@ pub struct PointerGesture {
     pub last_x: i16,
     pub last_y: i16,
     pub started: Instant,
+    pub keyboard_owned: bool,
+    pub keyboard_key_index: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -45,6 +50,7 @@ pub struct ShellState {
     pub redraw: bool,
     pub should_exit: bool,
     pub managed_windows: Vec<u32>,
+    pub keyboard: KeyboardState,
     app_launch_started: Option<Instant>,
     app_window_mapped_at: Option<Instant>,
 }
@@ -68,6 +74,7 @@ pub struct PublicState {
     pub pointer_active: bool,
     pub managed_windows: Vec<u32>,
     pub app_launching: bool,
+    pub keyboard: PublicKeyboardState,
 }
 
 impl ShellState {
@@ -91,6 +98,7 @@ impl ShellState {
             redraw: true,
             should_exit: false,
             managed_windows: Vec::new(),
+            keyboard: KeyboardState::default(),
             app_launch_started: None,
             app_window_mapped_at: None,
         }
@@ -123,10 +131,12 @@ impl ShellState {
             pointer_active: self.pointer.is_some(),
             managed_windows: self.managed_windows.clone(),
             app_launching: self.app_launching(),
+            keyboard: self.keyboard.public(),
         }
     }
 
     pub fn lock(&mut self) {
+        self.keyboard.hide();
         self.view = View::Locked;
         self.clear_pin();
         self.pointer = None;
@@ -157,6 +167,7 @@ impl ShellState {
 
     pub fn home(&mut self) {
         if self.screen_awake && self.view != View::Locked {
+            self.keyboard.hide();
             self.view = View::Launcher;
             self.cancel_app_launch();
             self.last_action = "home".into();
@@ -166,6 +177,7 @@ impl ShellState {
 
     pub fn launch_system(&mut self) {
         if self.screen_awake && self.view != View::Locked && self.view != View::System {
+            self.keyboard.hide();
             self.view = View::System;
             self.managed_windows.clear();
             self.cancel_app_launch();
@@ -176,6 +188,7 @@ impl ShellState {
 
     pub fn launch_browser(&mut self) {
         if self.screen_awake && self.view != View::Locked && self.view != View::Browser {
+            self.keyboard.hide();
             self.view = View::Browser;
             self.begin_app_launch();
             self.last_action = "launch_browser".into();
@@ -261,6 +274,49 @@ impl ShellState {
         self.volume_overlay_until = Some(Instant::now() + Duration::from_millis(1800));
         self.last_action = "volume_set".into();
         self.redraw = true;
+    }
+
+    pub fn show_keyboard(&mut self, purpose: KeyboardPurpose) -> bool {
+        if !self.screen_awake
+            || !self.view.is_app()
+            || self.app_launching()
+            || self.managed_windows.is_empty()
+        {
+            self.last_action = "keyboard_show_blocked".into();
+            return false;
+        }
+        self.keyboard.show(purpose);
+        self.last_action = "keyboard_show".into();
+        true
+    }
+
+    pub fn hide_keyboard(&mut self) {
+        if self.keyboard.hide() {
+            self.last_action = "keyboard_hide".into();
+        }
+    }
+
+    pub fn activate_keyboard_key(&mut self, action: KeyAction) -> KeyboardEffect {
+        let effect = self.keyboard.activate(action);
+        self.last_action = match action {
+            KeyAction::Shift => "keyboard_shift",
+            KeyAction::ToggleLayout => "keyboard_layout",
+            KeyAction::Hide => "keyboard_hide",
+            KeyAction::Enter => "keyboard_submit",
+            KeyAction::Character(_) | KeyAction::Space | KeyAction::Backspace => "keyboard_input",
+        }
+        .into();
+        effect
+    }
+
+    pub fn note_managed_window_closed(&mut self, window: u32) {
+        if self.managed_windows.first().copied() == Some(window) {
+            self.hide_keyboard();
+        }
+        self.managed_windows.retain(|managed| *managed != window);
+        if self.managed_windows.is_empty() {
+            self.hide_keyboard();
+        }
     }
 
     pub fn update_device_status(&mut self, battery_percent: Option<u8>, wifi_connected: bool) {
@@ -433,5 +489,67 @@ mod tests {
         assert_eq!(state.view, View::System);
         assert!(!state.app_launching());
         assert!(!state.public(1080, 2340).app_launching);
+    }
+
+    #[test]
+    fn keyboard_state_follows_app_and_security_transitions() {
+        let mut state = ShellState::new(false, 50);
+        state.launch_system();
+        state.managed_windows.push(42);
+        assert!(state.show_keyboard(KeyboardPurpose::Text));
+        assert!(state.keyboard.is_visible());
+
+        state.home();
+        assert_eq!(state.view, View::Launcher);
+        assert!(!state.keyboard.is_visible());
+
+        state.launch_system();
+        state.managed_windows.push(43);
+        assert!(state.show_keyboard(KeyboardPurpose::Search));
+        state.note_managed_window_closed(43);
+        assert!(!state.keyboard.is_visible());
+
+        state.managed_windows.push(44);
+        assert!(state.show_keyboard(KeyboardPurpose::Password));
+        state.lock();
+        assert_eq!(state.view, View::Locked);
+        assert!(!state.keyboard.is_visible());
+    }
+
+    #[test]
+    fn password_keyboard_public_state_has_no_typed_content() {
+        let mut state = ShellState::new(false, 50);
+        state.launch_system();
+        state.managed_windows.push(42);
+        assert!(state.show_keyboard(KeyboardPurpose::Password));
+        assert!(matches!(
+            state.activate_keyboard_key(KeyAction::Character('x')),
+            KeyboardEffect::Inject(crate::keyboard::KeyboardInput::Character('x'))
+        ));
+
+        let public = serde_json::to_value(state.public(1080, 2340)).unwrap();
+        assert_eq!(
+            public.get("keyboard").unwrap(),
+            &serde_json::json!({
+                "visible": true,
+                "purpose": "password",
+                "shift": false,
+                "layout": "letters"
+            })
+        );
+        assert_eq!(state.last_action, "keyboard_input");
+    }
+
+    #[test]
+    fn keyboard_request_and_app_launch_are_blocked_on_lock() {
+        let mut state = ShellState::new(true, 50);
+        state.managed_windows.push(42);
+        assert!(!state.show_keyboard(KeyboardPurpose::Url));
+        state.launch_browser();
+        state.launch_system();
+        assert_eq!(state.view, View::Locked);
+        assert!(!state.keyboard.is_visible());
+        assert_eq!(state.public(1080, 2340).current_app, None);
+        assert_eq!(state.last_action, "keyboard_show_blocked");
     }
 }

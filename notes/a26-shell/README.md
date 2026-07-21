@@ -14,6 +14,8 @@ the Samsung Galaxy A26 (SM-A266M).
   live CPU/GPU utilization, and used/remaining filesystem space;
 - bottom-edge gesture bar inside System, where swiping up closes the app;
 - volume overlay and root-only ADB/Unix-socket development controls.
+- global Moon-owned on-screen keyboard in a dedicated X11 window, with XTEST
+  delivery to the focused managed app and a key-free bottom close zone.
 
 ## Captured output
 
@@ -42,6 +44,8 @@ Pixel-level layout checks are recorded in
 - safe WM restart while the panel is blanked
 - root-only control socket and configuration permissions
 - static aarch64-musl build
+- keyboard layout/hit-test, state-transition, password-redaction, and lock
+  gating unit tests
 
 The lock screen is intentionally only a session UI. The reference development
 device has an unlocked bootloader, root, and authorized ADB, all of which can
