@@ -38,6 +38,8 @@ pub struct ShellState {
     pub lockout_until: Option<Instant>,
     pub volume: u8,
     pub volume_overlay_until: Option<Instant>,
+    pub battery_percent: Option<u8>,
+    pub wifi_connected: bool,
     pub pointer: Option<PointerGesture>,
     pub last_action: String,
     pub redraw: bool,
@@ -56,6 +58,8 @@ pub struct PublicState {
     pub lockout_remaining_ms: u64,
     pub current_app: Option<&'static str>,
     pub volume: u8,
+    pub battery_percent: Option<u8>,
+    pub wifi_connected: bool,
     pub width: u16,
     pub height: u16,
     pub last_action: String,
@@ -77,6 +81,8 @@ impl ShellState {
             lockout_until: None,
             volume: initial_volume.min(100),
             volume_overlay_until: None,
+            battery_percent: None,
+            wifi_connected: false,
             pointer: None,
             last_action: "startup".into(),
             redraw: true,
@@ -104,6 +110,8 @@ impl ShellState {
                 View::Locked | View::Launcher => None,
             },
             volume: self.volume,
+            battery_percent: self.battery_percent,
+            wifi_connected: self.wifi_connected,
             width,
             height,
             last_action: self.last_action.clone(),
@@ -242,6 +250,15 @@ impl ShellState {
         self.volume_overlay_until = Some(Instant::now() + Duration::from_millis(1800));
         self.last_action = "volume_set".into();
         self.redraw = true;
+    }
+
+    pub fn update_device_status(&mut self, battery_percent: Option<u8>, wifi_connected: bool) {
+        let battery_percent = battery_percent.map(|value| value.min(100));
+        if self.battery_percent != battery_percent || self.wifi_connected != wifi_connected {
+            self.battery_percent = battery_percent;
+            self.wifi_connected = wifi_connected;
+            self.redraw = true;
+        }
     }
 
     pub fn tick(&mut self) {

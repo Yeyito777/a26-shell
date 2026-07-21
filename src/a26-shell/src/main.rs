@@ -3,6 +3,7 @@ mod font;
 mod input;
 mod ipc;
 mod model;
+mod status;
 mod ui;
 
 use std::env;
@@ -34,6 +35,7 @@ const KEY_VOLUME_DOWN: u8 = 122;
 const KEY_VOLUME_UP: u8 = 123;
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
 const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
+const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct RawTouchTracker {
@@ -119,14 +121,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         root,
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
-        b"a26-shell",
+        b"moon",
     )?;
     conn.change_property8(
         PropMode::REPLACE,
         shell_window,
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
-        b"a26-shell-ui",
+        b"moon-shell",
     )?;
 
     let gc = conn.generate_id()?;
@@ -158,6 +160,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let ipc = IpcServer::bind(&config.socket_path)?;
     let mut state = ShellState::new(config.start_locked, config.initial_volume);
+    let initial_status = status::DeviceStatus::read();
+    state.update_device_status(
+        initial_status.battery_percent,
+        initial_status.wifi_connected,
+    );
+    let mut next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
     let mut power_key = match PowerKey::open("/dev/input/event1") {
         Ok(device) => {
             eprintln!("physical power key ready at /dev/input/event1");
@@ -244,6 +252,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         reconcile_apps(&mut state, &mut system_app, &mut browser_app);
+        if Instant::now() >= next_device_status {
+            let device_status = status::DeviceStatus::read();
+            state.update_device_status(device_status.battery_percent, device_status.wifi_connected);
+            next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
+        }
         state.tick();
         if state.screen_awake != hardware_awake {
             // Draw the safe frame before changing brightness. During wake the

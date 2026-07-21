@@ -85,7 +85,7 @@ impl Renderer {
         conn: &C,
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
-        self.center_text(conn, "A26 LOCKED", 250, 10, ACCENT)?;
+        self.center_text(conn, "MOON LOCKED", 250, 10, ACCENT)?;
         self.center_text(conn, "ENTER PIN", 390, 6, MUTED)?;
 
         let dots_width = 6 * 70;
@@ -137,14 +137,21 @@ impl Renderer {
         conn: &C,
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
-        self.text(conn, "A26", 64, 88, 8, FG)?;
+        self.text(conn, "MOON", 64, 88, 8, FG)?;
         self.text(conn, "LINUX", 66, 172, 3, MUTED)?;
-        let volume = format!("VOL {}", state.volume);
-        let volume_x = self
+        let device_status = launcher_status_text(state.battery_percent, state.wifi_connected);
+        let status_x = self
             .width
             .saturating_sub(64)
-            .saturating_sub(font::text_width(&volume, 4));
-        self.text(conn, &volume, volume_x as i16, 112, 4, MUTED)?;
+            .saturating_sub(font::text_width(&device_status, 4));
+        self.text(
+            conn,
+            &device_status,
+            status_x as i16,
+            112,
+            4,
+            if state.wifi_connected { ACCENT } else { MUTED },
+        )?;
 
         // A quiet one-pixel divider preserves the palette without turning the
         // header into another card.
@@ -398,6 +405,14 @@ impl Renderer {
     }
 }
 
+fn launcher_status_text(battery_percent: Option<u8>, wifi_connected: bool) -> String {
+    let battery = battery_percent
+        .map(|value| format!("BAT {}%", value.min(100)))
+        .unwrap_or_else(|| "BAT --".into());
+    let wifi = if wifi_connected { "WIFI" } else { "NO WIFI" };
+    format!("{battery}  {wifi}")
+}
+
 pub fn keypad_action_at(width: u16, x: i16, y: i16) -> Option<KeypadAction> {
     for digit in 1_u8..=9 {
         let index = digit - 1;
@@ -455,5 +470,12 @@ mod tests {
         assert!(!browser_app_at(174, 512));
         assert!(browser_app_at(490, 512));
         assert!(!system_app_at(490, 512));
+    }
+
+    #[test]
+    fn launcher_status_reports_battery_and_wifi_instead_of_volume() {
+        assert_eq!(launcher_status_text(Some(87), true), "BAT 87%  WIFI");
+        assert_eq!(launcher_status_text(None, false), "BAT --  NO WIFI");
+        assert_eq!(launcher_status_text(Some(200), true), "BAT 100%  WIFI");
     }
 }
