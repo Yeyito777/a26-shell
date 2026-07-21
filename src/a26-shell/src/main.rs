@@ -23,8 +23,9 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, Blanking, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _,
-    CreateGCAux, CreateWindowAux, EventMask, Exposures, GrabMode, InputFocus, ModMask, PropMode,
+    AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, Blanking, ButtonPressEvent,
+    ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux,
+    CreateWindowAux, EventMask, Exposures, GrabMode, InputFocus, KeyButMask, ModMask, PropMode,
     StackMode, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
@@ -218,6 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             handle_x_event(
                 &conn,
                 event,
+                root,
                 shell_window,
                 (width, height),
                 &config,
@@ -243,7 +245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (stream, request) in ipc.accept_all() {
             match request {
                 Ok(command) => {
-                    apply_command(command, width, height, &config, &mut state);
+                    apply_command(&conn, root, command, width, height, &config, &mut state);
                     let public = state.public(width, height);
                     ipc::respond(stream, Ok(&public));
                 }
@@ -343,9 +345,11 @@ fn parse_config_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(config)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_x_event(
     conn: &RustConnection,
     event: Event,
+    root: u32,
     shell_window: u32,
     dimensions: (u16, u16),
     config: &Config,
@@ -376,7 +380,16 @@ fn handle_x_event(
             pointer_move(state, raw_touch.x, raw_touch.y);
         }
         Event::XinputRawTouchEnd(event) if raw_touch.touch_id == Some(event.detail) => {
-            pointer_end(state, raw_touch.x, raw_touch.y, width, height, config);
+            pointer_end(
+                conn,
+                root,
+                state,
+                raw_touch.x,
+                raw_touch.y,
+                width,
+                height,
+                config,
+            );
             raw_touch.touch_id = None;
         }
         Event::Expose(event) if event.window == shell_window => state.redraw = true,
@@ -387,7 +400,16 @@ fn handle_x_event(
             pointer_move(state, event.event_x, event.event_y);
         }
         Event::ButtonRelease(event) if event.event == shell_window => {
-            pointer_end(state, event.event_x, event.event_y, width, height, config);
+            pointer_end(
+                conn,
+                root,
+                state,
+                event.event_x,
+                event.event_y,
+                width,
+                height,
+                config,
+            );
         }
         Event::KeyPress(event) => match event.detail {
             KEY_VOLUME_DOWN => state.change_volume(-5),
@@ -588,7 +610,17 @@ fn pointer_move(state: &mut ShellState, x: i16, y: i16) {
     }
 }
 
-fn pointer_end(state: &mut ShellState, x: i16, y: i16, width: u16, height: u16, config: &Config) {
+#[allow(clippy::too_many_arguments)]
+fn pointer_end(
+    conn: &RustConnection,
+    root: u32,
+    state: &mut ShellState,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    config: &Config,
+) {
     let Some(mut pointer) = state.pointer.take() else {
         return;
     };
@@ -611,14 +643,22 @@ fn pointer_end(state: &mut ShellState, x: i16, y: i16, width: u16, height: u16, 
         return;
     }
     if dx.abs() <= 35 && dy.abs() <= 35 && elapsed <= Duration::from_millis(650) {
-        handle_tap(state, x, y, width, config);
+        handle_tap(conn, root, state, x, y, width, config);
     } else {
         state.last_action = "gesture_cancel".into();
     }
     state.redraw = true;
 }
 
-fn handle_tap(state: &mut ShellState, x: i16, y: i16, width: u16, config: &Config) {
+fn handle_tap(
+    conn: &RustConnection,
+    root: u32,
+    state: &mut ShellState,
+    x: i16,
+    y: i16,
+    width: u16,
+    config: &Config,
+) {
     match state.view {
         View::Locked => match ui::keypad_action_at(width, x, y) {
             Some(KeypadAction::Digit(digit)) => state.input_digit(digit, config),
@@ -637,13 +677,32 @@ fn handle_tap(state: &mut ShellState, x: i16, y: i16, width: u16, config: &Confi
                 state.last_action = "launcher_tap_outside".into();
             }
         }
-        View::System => state.last_action = "system_tap".into(),
-        View::Browser => state.last_action = "browser_tap".into(),
+        View::System | View::Browser => {
+            let app_name = if state.view == View::System {
+                "system"
+            } else {
+                "browser"
+            };
+            let Some(window) = state.managed_windows.first().copied() else {
+                state.last_action = format!("{app_name}_tap_no_window");
+                state.redraw = true;
+                return;
+            };
+            match forward_tap(conn, root, window, x, y) {
+                Ok(()) => state.last_action = format!("{app_name}_tap_forwarded"),
+                Err(error) => {
+                    eprintln!("cannot forward tap to {app_name}: {error}");
+                    state.last_action = format!("{app_name}_tap_failed");
+                }
+            }
+        }
     }
     state.redraw = true;
 }
 
 fn apply_command(
+    conn: &RustConnection,
+    root: u32,
     command: Command,
     width: u16,
     height: u16,
@@ -657,10 +716,10 @@ fn apply_command(
         Command::Submit => {
             state.submit_pin(config);
         }
-        Command::Tap(x, y) => handle_tap(state, x, y, width, config),
+        Command::Tap(x, y) => handle_tap(conn, root, state, x, y, width, config),
         Command::PointerBegin(x, y) => pointer_begin(state, x, y),
         Command::PointerMove(x, y) => pointer_move(state, x, y),
-        Command::PointerEnd(x, y) => pointer_end(state, x, y, width, height, config),
+        Command::PointerEnd(x, y) => pointer_end(conn, root, state, x, y, width, height, config),
         Command::Lock => state.lock(),
         Command::Home => state.home(),
         Command::LaunchSystem => state.launch_system(),
@@ -679,6 +738,35 @@ fn apply_command(
         Command::ScreenOn => state.screen_on(),
         Command::Quit => state.should_exit = true,
     }
+}
+
+fn forward_tap(
+    conn: &RustConnection,
+    root: u32,
+    window: u32,
+    x: i16,
+    y: i16,
+) -> Result<(), Box<dyn Error>> {
+    for response_type in [BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT] {
+        let event = ButtonPressEvent {
+            response_type,
+            detail: 1,
+            sequence: 0,
+            time: CURRENT_TIME,
+            root,
+            event: window,
+            child: 0,
+            root_x: x,
+            root_y: y,
+            event_x: x,
+            event_y: y,
+            state: KeyButMask::default(),
+            same_screen: true,
+        };
+        conn.send_event(false, window, EventMask::NO_EVENT, event)?
+            .check()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
