@@ -138,20 +138,7 @@ impl Renderer {
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
         self.text(conn, "MOON", 64, 88, 8, FG)?;
-        self.text(conn, "LINUX", 66, 172, 3, MUTED)?;
-        let device_status = launcher_status_text(state.battery_percent, state.wifi_connected);
-        let status_x = self
-            .width
-            .saturating_sub(64)
-            .saturating_sub(font::text_width(&device_status, 4));
-        self.text(
-            conn,
-            &device_status,
-            status_x as i16,
-            112,
-            4,
-            if state.wifi_connected { ACCENT } else { MUTED },
-        )?;
+        self.render_device_status(conn, state)?;
 
         // A quiet one-pixel divider preserves the palette without turning the
         // header into another card.
@@ -160,16 +147,16 @@ impl Renderer {
             BG_CARD,
             Rectangle {
                 x: 64,
-                y: 252,
+                y: 216,
                 width: self.width - 128,
                 height: 1,
             },
         )?;
-        self.text(conn, "APPS", 64, 322, 4, MUTED)?;
+        self.text(conn, "APPS", 64, 286, 4, MUTED)?;
 
         let icon = Rectangle {
             x: 64,
-            y: 402,
+            y: 366,
             width: APP_ICON_SIZE,
             height: APP_ICON_SIZE,
         };
@@ -185,11 +172,11 @@ impl Renderer {
             },
             1,
         )?;
-        self.centered_in(conn, "SYSTEM", (64, 658, APP_ICON_SIZE), 5, FG)?;
+        self.centered_in(conn, "SYSTEM", (64, 622, APP_ICON_SIZE), 5, FG)?;
 
         let browser = Rectangle {
             x: 380,
-            y: 402,
+            y: 366,
             width: APP_ICON_SIZE,
             height: APP_ICON_SIZE,
         };
@@ -211,7 +198,85 @@ impl Renderer {
             },
             1,
         )?;
-        self.centered_in(conn, "BROWSER", (380, 658, APP_ICON_SIZE), 5, FG)?;
+        self.centered_in(conn, "BROWSER", (380, 622, APP_ICON_SIZE), 5, FG)?;
+        Ok(())
+    }
+
+    fn render_device_status<C: Connection>(
+        &self,
+        conn: &C,
+        state: &ShellState,
+    ) -> Result<(), Box<dyn Error>> {
+        let wifi_color = if state.wifi_connected { ACCENT } else { MUTED };
+        self.text(conn, "WIFI", 680, 112, 3, wifi_color)?;
+        self.fill(
+            conn,
+            if state.wifi_connected { ACCENT } else { DANGER },
+            Rectangle {
+                x: 770,
+                y: 119,
+                width: 14,
+                height: 14,
+            },
+        )?;
+        self.fill(
+            conn,
+            BG_CARD,
+            Rectangle {
+                x: 816,
+                y: 96,
+                width: 1,
+                height: 52,
+            },
+        )?;
+
+        let battery_text = battery_status_text(state.battery_percent);
+        let battery_x = 962_i16;
+        let text_width = font::text_width(&battery_text, 4);
+        self.text(
+            conn,
+            &battery_text,
+            battery_x - 18 - text_width as i16,
+            108,
+            4,
+            FG,
+        )?;
+        self.outline(
+            conn,
+            MUTED,
+            Rectangle {
+                x: battery_x,
+                y: 106,
+                width: 44,
+                height: 28,
+            },
+            2,
+        )?;
+        self.fill(
+            conn,
+            MUTED,
+            Rectangle {
+                x: battery_x + 44,
+                y: 114,
+                width: 8,
+                height: 12,
+            },
+        )?;
+        if let Some(percent) = state.battery_percent {
+            let fill_width = battery_fill_width(percent);
+            if fill_width > 0 {
+                self.fill(
+                    conn,
+                    if percent <= 20 { DANGER } else { ACCENT },
+                    Rectangle {
+                        x: battery_x + 4,
+                        y: 110,
+                        width: fill_width,
+                        height: 20,
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -405,12 +470,14 @@ impl Renderer {
     }
 }
 
-fn launcher_status_text(battery_percent: Option<u8>, wifi_connected: bool) -> String {
-    let battery = battery_percent
-        .map(|value| format!("BAT {}%", value.min(100)))
-        .unwrap_or_else(|| "BAT --".into());
-    let wifi = if wifi_connected { "WIFI" } else { "NO WIFI" };
-    format!("{battery}  {wifi}")
+fn battery_status_text(battery_percent: Option<u8>) -> String {
+    battery_percent
+        .map(|value| format!("{}%", value.min(100)))
+        .unwrap_or_else(|| "--".into())
+}
+
+fn battery_fill_width(battery_percent: u8) -> u16 {
+    u16::from(battery_percent.min(100)) * 36 / 100
 }
 
 pub fn keypad_action_at(width: u16, x: i16, y: i16) -> Option<KeypadAction> {
@@ -443,11 +510,11 @@ pub enum KeypadAction {
 }
 
 pub fn system_app_at(x: i16, y: i16) -> bool {
-    (48..=300).contains(&x) && (380..=710).contains(&y)
+    (48..=300).contains(&x) && (344..=674).contains(&y)
 }
 
 pub fn browser_app_at(x: i16, y: i16) -> bool {
-    (364..=616).contains(&x) && (380..=710).contains(&y)
+    (364..=616).contains(&x) && (344..=674).contains(&y)
 }
 
 fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
@@ -473,9 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn launcher_status_reports_battery_and_wifi_instead_of_volume() {
-        assert_eq!(launcher_status_text(Some(87), true), "BAT 87%  WIFI");
-        assert_eq!(launcher_status_text(None, false), "BAT --  NO WIFI");
-        assert_eq!(launcher_status_text(Some(200), true), "BAT 100%  WIFI");
+    fn battery_status_is_bounded_and_compact() {
+        assert_eq!(battery_status_text(Some(87)), "87%");
+        assert_eq!(battery_status_text(None), "--");
+        assert_eq!(battery_status_text(Some(200)), "100%");
+        assert_eq!(battery_fill_width(0), 0);
+        assert_eq!(battery_fill_width(50), 18);
+        assert_eq!(battery_fill_width(200), 36);
     }
 }
