@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use config::Config;
-use input::{Backlight, PowerKey};
+use input::{Backlight, PowerKey, TouchscreenPower};
 use ipc::{Command, IpcServer};
 use model::{PointerGesture, ShellState, View};
 use ui::{KeypadAction, Renderer};
@@ -22,8 +22,9 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux,
-    CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, PropMode, StackMode, WindowClass,
+    AtomEnum, Blanking, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _,
+    CreateGCAux, CreateWindowAux, EventMask, Exposures, GrabMode, InputFocus, ModMask, PropMode,
+    StackMode, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -70,6 +71,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     conn.xfixes_query_version(4, 0)?.reply()?;
+    // A direct PMIC power-key read is invisible to the X server. Disable Xorg's
+    // independent blanking/DPMS timers so it cannot blank while our shell still
+    // believes the screen is awake (volume keys previously appeared to be the
+    // only reliable wake because they happened to be X events).
+    conn.set_screen_saver(0, 0, Blanking::DEFAULT, Exposures::DEFAULT)?
+        .check()?;
     let raw_touch_mask = xinput::XIEventMask::RAW_TOUCH_BEGIN
         | xinput::XIEventMask::RAW_TOUCH_UPDATE
         | xinput::XIEventMask::RAW_TOUCH_END;
@@ -168,11 +175,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         }
     };
+    let touchscreen = match TouchscreenPower::open("/sys/class/sec/tsp/enabled") {
+        Ok(device) => Some(device),
+        Err(error) => {
+            eprintln!("touchscreen power control unavailable: {error}");
+            None
+        }
+    };
     let mut hardware_awake = true;
     let mut raw_touch = RawTouchTracker::default();
     let mut system_app: Option<Child> = None;
     let mut browser_app: Option<Child> = None;
     renderer.render(&conn, &state)?;
+    if let Some(device) = touchscreen.as_ref()
+        && let Err(error) = device.on()
+    {
+        eprintln!("initial touchscreen wake failed: {error}");
+    }
     if let Some(device) = backlight.as_ref() {
         if let Err(error) = device.on() {
             eprintln!("initial panel wake failed: {error}");
@@ -202,7 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(device) = power_key.as_mut() {
             match device.poll_presses() {
                 Ok(count) => {
-                    for _ in 0..count {
+                    if count > 0 {
                         state.toggle_screen();
                     }
                 }
@@ -231,15 +250,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             // lock screen is therefore complete before the panel lights up.
             renderer.render(&conn, &state)?;
             state.redraw = false;
-            if let Some(device) = backlight.as_mut() {
-                let result = if state.screen_awake {
-                    device.on()
-                } else {
-                    device.off()
-                };
-                if let Err(error) = result {
-                    eprintln!("panel backlight transition failed: {error}");
+            if state.screen_awake {
+                if let Some(device) = touchscreen.as_ref()
+                    && let Err(error) = device.on()
+                {
+                    eprintln!("touchscreen wake failed: {error}");
+                }
+                if let Some(device) = backlight.as_mut()
+                    && let Err(error) = device.on()
+                {
+                    eprintln!("panel backlight wake failed: {error}");
                     backlight = None;
+                }
+            } else {
+                if let Some(device) = backlight.as_mut()
+                    && let Err(error) = device.off()
+                {
+                    eprintln!("panel backlight sleep failed: {error}");
+                    backlight = None;
+                }
+                if let Some(device) = touchscreen.as_ref()
+                    && let Err(error) = device.off()
+                {
+                    eprintln!("touchscreen sleep failed: {error}");
                 }
             }
             hardware_awake = state.screen_awake;
@@ -263,6 +296,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !state.screen_awake {
         state.screen_on();
         let _ = renderer.render(&conn, &state);
+        if let Some(device) = touchscreen.as_ref() {
+            let _ = device.on();
+        }
         if let Some(device) = backlight.as_ref() {
             let _ = device.on();
         }

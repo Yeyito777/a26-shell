@@ -3,6 +3,7 @@ use std::io::{self, ErrorKind, Read};
 use std::mem::size_of;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const EV_KEY: u16 = 0x01;
 const KEY_POWER: u16 = 116;
@@ -13,6 +14,7 @@ const KEY_PRESSED: i32 = 1;
 pub struct PowerKey {
     file: File,
     pending: Vec<u8>,
+    last_press: Option<Instant>,
 }
 
 impl PowerKey {
@@ -24,6 +26,7 @@ impl PowerKey {
         Ok(Self {
             file,
             pending: Vec::new(),
+            last_press: None,
         })
     }
 
@@ -52,11 +55,41 @@ impl PowerKey {
                 event[timeval_bytes + 7],
             ]);
             if kind == EV_KEY && code == KEY_POWER && value == KEY_PRESSED {
-                presses += 1;
+                let now = Instant::now();
+                if self
+                    .last_press
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(350))
+                {
+                    self.last_press = Some(now);
+                    presses += 1;
+                }
             }
         }
         self.pending.drain(..complete);
         Ok(presses)
+    }
+}
+
+/// Samsung's downstream touchscreen requires paired display-state and event
+/// values rather than a boolean. `2,1` is the completed DISPLAY_STATE_ON event;
+/// `1,0` is the early DISPLAY_STATE_OFF event for this exact firmware.
+pub struct TouchscreenPower {
+    enabled_path: PathBuf,
+}
+
+impl TouchscreenPower {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let enabled_path = path.as_ref().to_path_buf();
+        fs::metadata(&enabled_path)?;
+        Ok(Self { enabled_path })
+    }
+
+    pub fn off(&self) -> io::Result<()> {
+        fs::write(&self.enabled_path, b"1,0\n")
+    }
+
+    pub fn on(&self) -> io::Result<()> {
+        fs::write(&self.enabled_path, b"2,1\n")
     }
 }
 
