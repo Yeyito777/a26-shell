@@ -167,7 +167,8 @@ impl ShellState {
     pub fn launch_system(&mut self) {
         if self.screen_awake && self.view != View::Locked && self.view != View::System {
             self.view = View::System;
-            self.begin_app_launch();
+            self.managed_windows.clear();
+            self.cancel_app_launch();
             self.last_action = "launch_system".into();
             self.redraw = true;
         }
@@ -272,7 +273,7 @@ impl ShellState {
     }
 
     pub fn app_launching(&self) -> bool {
-        self.view.is_app() && self.app_launch_started.is_some()
+        self.view == View::Browser && self.app_launch_started.is_some()
     }
 
     pub fn app_launch_elapsed(&self) -> Duration {
@@ -298,12 +299,7 @@ impl ShellState {
         let Some(mapped_at) = self.app_window_mapped_at else {
             return false;
         };
-        let settle_time = match self.view {
-            View::System => Duration::from_millis(180),
-            View::Browser => Duration::from_millis(1500),
-            View::Locked | View::Launcher => return false,
-        };
-        mapped_at.elapsed() >= settle_time
+        self.view == View::Browser && mapped_at.elapsed() >= Duration::from_millis(1500)
     }
 
     pub fn finish_app_launch(&mut self) {
@@ -312,12 +308,10 @@ impl ShellState {
         }
         self.app_launch_started = None;
         self.app_window_mapped_at = None;
-        self.last_action = match self.view {
-            View::System => "system_ready",
-            View::Browser => "browser_ready",
-            View::Locked | View::Launcher => return,
+        if self.view != View::Browser {
+            return;
         }
-        .into();
+        self.last_action = "browser_ready".into();
         self.redraw = true;
     }
 
@@ -430,5 +424,14 @@ mod tests {
         assert!(state.app_ready_to_reveal());
         state.finish_app_launch();
         assert!(!state.app_launching());
+    }
+
+    #[test]
+    fn fast_system_app_does_not_enter_launch_overlay() {
+        let mut state = ShellState::new(false, 50);
+        state.launch_system();
+        assert_eq!(state.view, View::System);
+        assert!(!state.app_launching());
+        assert!(!state.public(1080, 2340).app_launching);
     }
 }

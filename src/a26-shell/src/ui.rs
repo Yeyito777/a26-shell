@@ -36,6 +36,7 @@ pub fn load_browser_icon() -> Option<Vec<u8>> {
 
 pub struct Renderer {
     pub window: Window,
+    pub back_buffer: u32,
     pub gc: Gcontext,
     pub width: u16,
     pub height: u16,
@@ -62,7 +63,7 @@ impl Renderer {
         if !state.screen_awake {
             // The runtime also turns off the panel backlight, but retain a
             // black X framebuffer as a safe fallback.
-            conn.flush()?;
+            self.present(conn)?;
             return Ok(());
         }
         match state.view {
@@ -79,7 +80,7 @@ impl Renderer {
         {
             self.render_volume(conn, state.volume)?;
         }
-        conn.flush()?;
+        self.present(conn)?;
         Ok(())
     }
 
@@ -212,8 +213,8 @@ impl Renderer {
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
         let (name, icon, fallback, accent) = match state.view {
-            View::System => ("SYSTEM", self.system_icon.as_deref(), "SYS", ACCENT_2),
             View::Browser => ("BROWSER", self.browser_icon.as_deref(), "WEB", ACCENT),
+            View::System => return Ok(()),
             View::Locked | View::Launcher => return Ok(()),
         };
         let icon_x = self.width.saturating_sub(APP_ICON_SIZE) / 2;
@@ -376,7 +377,7 @@ impl Renderer {
         if let Some(icon) = icon {
             conn.put_image(
                 ImageFormat::Z_PIXMAP,
-                self.window,
+                self.back_buffer,
                 self.gc,
                 APP_ICON_SIZE,
                 APP_ICON_SIZE,
@@ -459,7 +460,7 @@ impl Renderer {
         let rectangles = font::rectangles(text, x, y, scale);
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(color))?;
         if !rectangles.is_empty() {
-            conn.poly_fill_rectangle(self.window, self.gc, &rectangles)?;
+            conn.poly_fill_rectangle(self.back_buffer, self.gc, &rectangles)?;
         }
         Ok(())
     }
@@ -471,7 +472,7 @@ impl Renderer {
         rect: Rectangle,
     ) -> Result<(), Box<dyn Error>> {
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(color))?;
-        conn.poly_fill_rectangle(self.window, self.gc, &[rect])?;
+        conn.poly_fill_rectangle(self.back_buffer, self.gc, &[rect])?;
         Ok(())
     }
 
@@ -512,7 +513,26 @@ impl Renderer {
             },
         ];
         conn.change_gc(self.gc, &ChangeGCAux::new().foreground(color))?;
-        conn.poly_fill_rectangle(self.window, self.gc, &lines)?;
+        conn.poly_fill_rectangle(self.back_buffer, self.gc, &lines)?;
+        Ok(())
+    }
+
+    fn present<C: Connection>(&self, conn: &C) -> Result<(), Box<dyn Error>> {
+        // Build the complete frame off-screen and expose it with one server
+        // operation. This prevents the 120 Hz panel from scanning out the
+        // intermediate background/text/icon drawing requests.
+        conn.copy_area(
+            self.back_buffer,
+            self.window,
+            self.gc,
+            0,
+            0,
+            0,
+            0,
+            self.width,
+            self.height,
+        )?;
+        conn.flush()?;
         Ok(())
     }
 }

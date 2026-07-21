@@ -133,6 +133,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         b"moon-shell",
     )?;
 
+    let shell_back_buffer = conn.generate_id()?;
+    conn.create_pixmap(
+        screen.root_depth,
+        shell_back_buffer,
+        shell_window,
+        width,
+        height,
+    )?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, shell_window, &CreateGCAux::new().graphics_exposures(0))?;
     conn.map_window(shell_window)?;
@@ -154,6 +162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let renderer = Renderer {
         window: shell_window,
+        back_buffer: shell_back_buffer,
         gc,
         width,
         height,
@@ -335,6 +344,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     stop_system_app(&mut system_app);
     stop_system_app(&mut browser_app);
     let _ = conn.destroy_window(shell_window);
+    let _ = conn.free_pixmap(shell_back_buffer);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
     eprintln!("a26-shell stopping");
