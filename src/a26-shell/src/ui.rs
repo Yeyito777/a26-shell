@@ -137,7 +137,9 @@ impl Renderer {
         conn: &C,
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
-        self.text(conn, "MOON", 64, 88, 8, FG)?;
+        // Keep the identity and device status on one visual baseline. Moon is
+        // deliberately quiet here so the applications remain the focus.
+        self.text(conn, "MOON", 64, 92, 6, FG)?;
         self.render_device_status(conn, state)?;
 
         // A quiet one-pixel divider preserves the palette without turning the
@@ -147,16 +149,15 @@ impl Renderer {
             BG_CARD,
             Rectangle {
                 x: 64,
-                y: 216,
+                y: 184,
                 width: self.width - 128,
                 height: 1,
             },
         )?;
-        self.text(conn, "APPS", 64, 286, 4, MUTED)?;
 
         let icon = Rectangle {
             x: 64,
-            y: 366,
+            y: 256,
             width: APP_ICON_SIZE,
             height: APP_ICON_SIZE,
         };
@@ -172,11 +173,11 @@ impl Renderer {
             },
             1,
         )?;
-        self.centered_in(conn, "SYSTEM", (64, 622, APP_ICON_SIZE), 5, FG)?;
+        self.centered_in(conn, "SYSTEM", (64, 512, APP_ICON_SIZE), 5, FG)?;
 
         let browser = Rectangle {
             x: 380,
-            y: 366,
+            y: 256,
             width: APP_ICON_SIZE,
             height: APP_ICON_SIZE,
         };
@@ -198,7 +199,7 @@ impl Renderer {
             },
             1,
         )?;
-        self.centered_in(conn, "BROWSER", (380, 622, APP_ICON_SIZE), 5, FG)?;
+        self.centered_in(conn, "BROWSER", (380, 512, APP_ICON_SIZE), 5, FG)?;
         Ok(())
     }
 
@@ -208,13 +209,13 @@ impl Renderer {
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
         let wifi_color = if state.wifi_connected { ACCENT } else { MUTED };
-        self.text(conn, "WIFI", 680, 112, 3, wifi_color)?;
+        self.text(conn, "WIFI", 680, 102, 3, wifi_color)?;
         self.fill(
             conn,
             if state.wifi_connected { ACCENT } else { DANGER },
             Rectangle {
                 x: 770,
-                y: 119,
+                y: 106,
                 width: 14,
                 height: 14,
             },
@@ -224,9 +225,9 @@ impl Renderer {
             BG_CARD,
             Rectangle {
                 x: 816,
-                y: 96,
+                y: 88,
                 width: 1,
-                height: 52,
+                height: 50,
             },
         )?;
 
@@ -237,7 +238,7 @@ impl Renderer {
             conn,
             &battery_text,
             battery_x - 18 - text_width as i16,
-            108,
+            99,
             4,
             FG,
         )?;
@@ -246,7 +247,7 @@ impl Renderer {
             MUTED,
             Rectangle {
                 x: battery_x,
-                y: 106,
+                y: 99,
                 width: 44,
                 height: 28,
             },
@@ -257,7 +258,7 @@ impl Renderer {
             MUTED,
             Rectangle {
                 x: battery_x + 44,
-                y: 114,
+                y: 107,
                 width: 8,
                 height: 12,
             },
@@ -270,7 +271,7 @@ impl Renderer {
                     if percent <= 20 { DANGER } else { ACCENT },
                     Rectangle {
                         x: battery_x + 4,
-                        y: 110,
+                        y: 103,
                         width: fill_width,
                         height: 20,
                     },
@@ -510,11 +511,11 @@ pub enum KeypadAction {
 }
 
 pub fn system_app_at(x: i16, y: i16) -> bool {
-    (48..=300).contains(&x) && (344..=674).contains(&y)
+    (48..=300).contains(&x) && (232..=564).contains(&y)
 }
 
 pub fn browser_app_at(x: i16, y: i16) -> bool {
-    (364..=616).contains(&x) && (344..=674).contains(&y)
+    (364..=616).contains(&x) && (232..=564).contains(&y)
 }
 
 fn keypad_center(width: u16, column: u8, row: u8) -> (i16, i16) {
