@@ -46,6 +46,14 @@ Pixel-level layout checks are recorded in
 - static aarch64-musl build
 - keyboard layout/hit-test, state-transition, password-redaction, and lock
   gating unit tests
+- autonomous Magisk late-start boot from a controlled full reboot: Android
+  completed vendor initialization, the phone-local supervisor committed its own
+  matching Xorg safety token, Moon reached its lock screen without a host start
+  command, native Wi-Fi re-associated, and the persistent failure counter reset
+  to zero
+- Android fallback policy for a preceding kernel panic, three failed starts,
+  explicit disable/skip-once markers, a post-boot volume-key override, and an
+  8% low-battery threshold
 
 The lock screen is intentionally only a session UI. The reference development
 device has an unlocked bootloader, root, and authorized ADB, all of which can

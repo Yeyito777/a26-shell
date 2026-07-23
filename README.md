@@ -84,9 +84,39 @@ Start just the shell when Xorg is already running:
 scripts/a26-shell/start.sh
 ```
 
-The `desktop-start.sh` and `desktop-stop.sh` wrappers integrate with the wider
-Galaxy A26 research workspace's native-Xorg takeover scripts, which are not
-part of this standalone repository.
+The `desktop-start.sh` and `desktop-stop.sh` wrappers use the included safe
+native-Xorg handoff scripts. The prepared Alpine rootfs, stock-firmware-specific
+Xorg configuration, Magisk installation, and Wi-Fi backend remain device setup
+prerequisites rather than artifacts published in this repository.
+
+## Default Moon boot session
+
+Moon can be installed as the phone's autonomous default session while retaining
+Samsung Android as the hardware bootstrap and recovery environment:
+
+```sh
+scripts/a26-shell/install-autostart.sh
+scripts/a26-shell/autostart.sh status
+```
+
+The Magisk `service.d` entry waits for Android/vendor initialization and data
+decryption, then performs the proven DRM handoff, verifies Xorg locally, starts
+Moon, and monitors the session without a host computer. Android remains active
+instead when the preceding boot was a kernel panic, required hardware is
+missing, startup repeatedly fails, or the battery is too low. At runtime Moon
+returns to Android charging mode at 8% rather than reaching PMIC undervoltage
+shutdown.
+
+To remain in Android for one boot, press either volume key during the eight
+second post-boot override window, or prepare it from an authorized host:
+
+```sh
+scripts/a26-shell/autostart.sh skip-once
+```
+
+Persistent control is available with `autostart.sh enable|disable`. Disabling
+while Moon is active also causes the device-local supervisor to restore Android
+within its next 30-second health interval.
 
 ## Development control
 

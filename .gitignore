@@ -14,6 +14,14 @@
 
 /scripts/*
 !/scripts/a26-shell/
+!/scripts/device/
+/scripts/device/*
+!/scripts/device/90-moon-autostart.sh
+!/scripts/device/moon-boot-supervisor.sh
+!/scripts/device/a26-xorg-takeover.sh
+!/scripts/device/a26-xorg-safety-watchdog.sh
+!/scripts/device/a26-android-graphics-restore.sh
+!/scripts/device/a26-xorg-persistent-session.sh
 /scripts/a26-shell/__pycache__/
 
 /notes/*

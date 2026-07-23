@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$PROJECT_ROOT/scripts/a26-shell/common.sh"
+SERIAL="$(a26_resolve_serial)"
+
+for script in \
+    "$PROJECT_ROOT/scripts/device/moon-boot-supervisor.sh" \
+    "$PROJECT_ROOT/scripts/device/90-moon-autostart.sh" \
+    "$PROJECT_ROOT/scripts/device/a26-xorg-takeover.sh" \
+    "$PROJECT_ROOT/scripts/device/a26-xorg-safety-watchdog.sh" \
+    "$PROJECT_ROOT/scripts/device/a26-android-graphics-restore.sh" \
+    "$PROJECT_ROOT/scripts/device/a26-xorg-persistent-session.sh"
+do
+    sh -n "$script"
+done
+
+adb -s "$SERIAL" get-state >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/moon-boot-supervisor.sh" \
+    /data/local/tmp/moon-boot-supervisor.sh >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/90-moon-autostart.sh" \
+    /data/local/tmp/90-moon-autostart.sh >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/a26-xorg-takeover.sh" \
+    /data/local/tmp/a26-xorg-takeover.sh.new >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/a26-xorg-safety-watchdog.sh" \
+    /data/local/tmp/a26-xorg-safety-watchdog.sh.new >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/a26-android-graphics-restore.sh" \
+    /data/local/tmp/a26-android-graphics-restore.sh.new >/dev/null
+adb -s "$SERIAL" push "$PROJECT_ROOT/scripts/device/a26-xorg-persistent-session.sh" \
+    /data/local/tmp/a26-xorg-persistent-session.sh >/dev/null
+
+adb -s "$SERIAL" shell '/data/local/tmp/su -c '\''
+set -eu
+mkdir -p /data/adb/moon /data/adb/service.d \
+    /data/local/a26-linux/usr/local/sbin
+chmod 0700 /data/adb/moon
+
+cp /data/local/tmp/moon-boot-supervisor.sh \
+    /data/adb/moon/moon-boot-supervisor.sh.new
+cp /data/local/tmp/90-moon-autostart.sh \
+    /data/adb/service.d/90-moon-autostart.sh.new
+cp /data/local/tmp/a26-xorg-takeover.sh.new \
+    /data/local/tmp/a26-xorg-takeover.sh
+cp /data/local/tmp/a26-xorg-safety-watchdog.sh.new \
+    /data/local/tmp/a26-xorg-safety-watchdog.sh
+cp /data/local/tmp/a26-android-graphics-restore.sh.new \
+    /data/local/tmp/a26-android-graphics-restore.sh
+cp /data/local/tmp/a26-xorg-persistent-session.sh \
+    /data/local/a26-linux/usr/local/sbin/a26-xorg-persistent-session
+
+chown 0:0 \
+    /data/adb/moon/moon-boot-supervisor.sh.new \
+    /data/adb/service.d/90-moon-autostart.sh.new \
+    /data/local/tmp/a26-xorg-takeover.sh \
+    /data/local/tmp/a26-xorg-safety-watchdog.sh \
+    /data/local/tmp/a26-android-graphics-restore.sh \
+    /data/local/a26-linux/usr/local/sbin/a26-xorg-persistent-session
+chmod 0700 /data/adb/moon/moon-boot-supervisor.sh.new
+chmod 0755 \
+    /data/adb/service.d/90-moon-autostart.sh.new \
+    /data/local/tmp/a26-xorg-takeover.sh \
+    /data/local/tmp/a26-xorg-safety-watchdog.sh \
+    /data/local/tmp/a26-android-graphics-restore.sh \
+    /data/local/a26-linux/usr/local/sbin/a26-xorg-persistent-session
+
+mv -f /data/adb/moon/moon-boot-supervisor.sh.new \
+    /data/adb/moon/moon-boot-supervisor.sh
+mv -f /data/adb/service.d/90-moon-autostart.sh.new \
+    /data/adb/service.d/90-moon-autostart.sh
+
+if [ ! -f /data/adb/moon/config ]; then
+    cat >/data/adb/moon/config <<EOF
+MIN_START_BATTERY=20
+LOW_BATTERY_FALLBACK=8
+MAX_START_FAILURES=3
+OVERRIDE_WINDOW_SECONDS=8
+EOF
+    chown 0:0 /data/adb/moon/config
+    chmod 0600 /data/adb/moon/config
+fi
+
+rm -f /data/adb/moon/disabled
+rm -f \
+    /data/local/tmp/moon-boot-supervisor.sh \
+    /data/local/tmp/90-moon-autostart.sh \
+    /data/local/tmp/a26-xorg-takeover.sh.new \
+    /data/local/tmp/a26-xorg-safety-watchdog.sh.new \
+    /data/local/tmp/a26-android-graphics-restore.sh.new \
+    /data/local/tmp/a26-xorg-persistent-session.sh
+
+ls -lZ \
+    /data/adb/service.d/90-moon-autostart.sh \
+    /data/adb/moon/moon-boot-supervisor.sh \
+    /data/adb/moon/config
+'\'''
+
+echo 'Installed and enabled autonomous Moon boot under Magisk service.d.'

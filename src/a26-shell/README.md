@@ -119,3 +119,26 @@ scripts/a26-shell/desktop-start.sh
 scripts/a26-shell/ctl.sh state
 scripts/a26-shell/desktop-stop.sh
 ```
+
+### Autonomous boot
+
+The phone can boot into Moon without a host-side ADB command. Android and the
+Samsung vendor services still start first because they initialize and decrypt
+the hardware environment used by Xorg. A Magisk late-start service then hands
+DRM/input/network ownership to the native session and launches Moon:
+
+```sh
+scripts/a26-shell/install-autostart.sh
+scripts/a26-shell/autostart.sh status
+```
+
+Safety policy:
+
+- wait for `sys.boot_completed`, `/dev/dri/card0`, and input initialization;
+- remain in Android after a kernel-panic reset or after three failed starts;
+- require at least 20% battery before takeover;
+- restore Android charging mode at 8%;
+- verify Xorg and Moon using phone-local status/control paths;
+- clean native Wi-Fi before restoring Android;
+- press a volume key during the eight-second override window to skip Moon once;
+- use `autostart.sh skip-once|disable|enable` for explicit host control.
