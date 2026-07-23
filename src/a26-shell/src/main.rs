@@ -1,3 +1,4 @@
+mod audio;
 mod config;
 mod font;
 mod input;
@@ -6,6 +7,7 @@ mod keyboard;
 mod model;
 mod status;
 mod ui;
+mod volume;
 
 use std::env;
 use std::error::Error;
@@ -14,12 +16,14 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use audio::AudioVolume;
 use config::Config;
-use input::{Backlight, PowerKey, TouchscreenPower};
+use input::{Backlight, PowerKey, TouchscreenPower, VolumeKey, VolumeKeys};
 use ipc::{Command, IpcServer};
 use keyboard::{KeyboardEffect, KeyboardGeometry, KeyboardSurface, XtestInjector};
 use model::{PointerGesture, ShellState, View};
 use ui::{KeypadAction, Renderer};
+use volume::VolumeSurface;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::ConnectionExt as _;
@@ -27,15 +31,13 @@ use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, Blanking, ChangeWindowAttributesAux,
     ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Exposures,
-    GrabMode, InputFocus, MOTION_NOTIFY_EVENT, ModMask, PropMode, StackMode, WindowClass,
+    InputFocus, MOTION_NOTIFY_EVENT, PropMode, StackMode, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
-const KEY_VOLUME_DOWN: u8 = 122;
-const KEY_VOLUME_UP: u8 = 123;
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
 const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
@@ -154,22 +156,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let keyboard_geometry = KeyboardGeometry::new(width, height);
     let mut keyboard_surface =
         KeyboardSurface::create(&conn, root, screen.root_depth, keyboard_geometry)?;
+    let mut volume_surface = VolumeSurface::create(&conn, root, screen.root_depth)?;
     conn.map_window(shell_window)?;
     conn.xfixes_hide_cursor(shell_window)?.check()?;
     conn.xfixes_hide_cursor(keyboard_surface.window)?.check()?;
+    conn.xfixes_hide_cursor(volume_surface.window)?.check()?;
     raise_shell(&conn, shell_window)?;
     conn.set_input_focus(InputFocus::PARENT, shell_window, CURRENT_TIME)?;
-    for keycode in [KEY_VOLUME_DOWN, KEY_VOLUME_UP] {
-        conn.grab_key(
-            false,
-            root,
-            ModMask::ANY,
-            keycode,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        )?
-        .check()?;
-    }
     conn.flush()?;
 
     let renderer = Renderer {
@@ -182,7 +175,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         browser_icon: ui::load_browser_icon(),
     };
     let ipc = IpcServer::bind(&config.socket_path)?;
-    let mut state = ShellState::new(config.start_locked, config.initial_volume);
+    let audio_volume = match AudioVolume::open("/run/moon-audio/volume") {
+        Ok(control) => Some(control),
+        Err(error) => {
+            eprintln!("audio volume control unavailable: {error}");
+            None
+        }
+    };
+    let initial_volume = audio_volume
+        .as_ref()
+        .and_then(|control| match control.get() {
+            Ok(volume) => Some(volume),
+            Err(error) => {
+                eprintln!("persisted audio volume unavailable: {error}");
+                None
+            }
+        })
+        .unwrap_or(config.initial_volume);
+    let mut state = ShellState::new(config.start_locked, initial_volume);
+    if let Some(control) = audio_volume.as_ref()
+        && let Err(error) = control.set(state.volume)
+    {
+        eprintln!("initial audio volume sync failed: {error}");
+    }
     let initial_status = status::DeviceStatus::read();
     state.update_device_status(
         initial_status.battery_percent,
@@ -197,6 +212,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Err(error) => {
             eprintln!("physical power key unavailable: {error}");
+            None
+        }
+    };
+    let mut volume_keys = match VolumeKeys::open("/dev/input/event0") {
+        Ok(device) => {
+            eprintln!("physical volume keys ready at /dev/input/event0");
+            Some(device)
+        }
+        Err(error) => {
+            eprintln!("physical volume keys unavailable: {error}");
             None
         }
     };
@@ -246,12 +271,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 root,
                 shell_window,
                 keyboard_surface.window,
+                volume_surface.window,
                 (width, height),
                 &keyboard_geometry,
                 &config,
                 &mut state,
                 &mut raw_touch,
                 &mut key_injector,
+                &mut volume_surface,
             )?;
         }
 
@@ -269,6 +296,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if let Some(device) = volume_keys.as_mut() {
+            match device.poll() {
+                Ok(keys) => {
+                    for key in keys {
+                        change_volume(
+                            &mut state,
+                            audio_volume.as_ref(),
+                            match key {
+                                VolumeKey::Down => -5,
+                                VolumeKey::Up => 5,
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("physical volume keys failed: {error}");
+                    volume_keys = None;
+                }
+            }
+        }
+
         for (stream, request) in ipc.accept_all() {
             match request {
                 Ok(command) => {
@@ -282,6 +330,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &config,
                         &mut state,
                         &key_injector,
+                        audio_volume.as_ref(),
                     );
                     let public = state.public(width, height);
                     ipc::respond(stream, Ok(&public));
@@ -325,6 +374,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             app_viewport = desired_viewport;
         }
         keyboard_surface.sync(&conn, &mut state.keyboard, keyboard_app_window)?;
+        let volume_visible = state.screen_awake
+            && state.view.is_app()
+            && !state.app_launching()
+            && state
+                .volume_overlay_until
+                .is_some_and(|deadline| deadline > Instant::now());
+        volume_surface.sync(&conn, volume_visible, state.volume)?;
         if Instant::now() >= next_device_status {
             let device_status = status::DeviceStatus::read();
             state.update_device_status(device_status.battery_percent, device_status.wifi_connected);
@@ -397,6 +453,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     stop_system_app(&mut browser_app);
     let _ = conn.destroy_window(shell_window);
     keyboard_surface.destroy(&conn);
+    volume_surface.destroy(&conn);
     let _ = conn.free_pixmap(shell_back_buffer);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
@@ -429,12 +486,14 @@ fn handle_x_event(
     root: u32,
     shell_window: u32,
     keyboard_window: u32,
+    volume_window: u32,
     dimensions: (u16, u16),
     keyboard_geometry: &KeyboardGeometry,
     config: &Config,
     state: &mut ShellState,
     raw_touch: &mut RawTouchTracker,
     key_injector: &mut XtestInjector,
+    volume_surface: &mut VolumeSurface,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height) = dimensions;
     match event {
@@ -478,6 +537,9 @@ fn handle_x_event(
         Event::Expose(event) if event.window == keyboard_window => {
             state.keyboard.request_redraw();
         }
+        Event::Expose(event) if event.window == volume_window => {
+            volume_surface.request_redraw();
+        }
         Event::ButtonPress(event) if event.event == shell_window => {
             pointer_begin(state, keyboard_geometry, event.event_x, event.event_y);
         }
@@ -498,13 +560,11 @@ fn handle_x_event(
                 key_injector,
             );
         }
-        Event::KeyPress(event) => match event.detail {
-            KEY_VOLUME_DOWN => state.change_volume(-5),
-            KEY_VOLUME_UP => state.change_volume(5),
-            _ => {}
-        },
         Event::MapRequest(event) => {
-            if event.window != shell_window && event.window != keyboard_window {
+            if event.window != shell_window
+                && event.window != keyboard_window
+                && event.window != volume_window
+            {
                 conn.map_window(event.window)?;
                 conn.xfixes_hide_cursor(event.window)?.check()?;
                 if !state.managed_windows.contains(&event.window) {
@@ -560,20 +620,28 @@ fn handle_x_event(
             }
         }
         Event::MapNotify(event)
-            if event.window != shell_window && event.window != keyboard_window =>
+            if event.window != shell_window
+                && event.window != keyboard_window
+                && event.window != volume_window =>
         {
             state.keyboard.request_raise();
+            volume_surface.request_redraw();
         }
         Event::ConfigureNotify(event)
-            if event.window != shell_window && event.window != keyboard_window =>
+            if event.window != shell_window
+                && event.window != keyboard_window
+                && event.window != volume_window =>
         {
             state.keyboard.request_raise();
+            volume_surface.request_redraw();
         }
         Event::DestroyNotify(event) => {
-            state.note_managed_window_closed(event.window);
+            if event.window != volume_window {
+                state.note_managed_window_closed(event.window);
+            }
         }
         Event::UnmapNotify(event) => {
-            if event.window != keyboard_window {
+            if event.window != keyboard_window && event.window != volume_window {
                 state.note_managed_window_closed(event.window);
             }
         }
@@ -911,22 +979,6 @@ fn handle_keyboard_action(
                 state.last_action = "keyboard_input_failed".into();
             }
         }
-        KeyboardEffect::Hide => {
-            // Dismiss editing as well as the surface. This gives clients a
-            // focus transition, so tapping the same page field later can
-            // request the keyboard again instead of remaining silently focused.
-            let result = state
-                .managed_windows
-                .first()
-                .copied()
-                .ok_or_else(|| "active app window is unavailable".into())
-                .and_then(|primary| {
-                    key_injector.inject(conn, keyboard::KeyboardInput::Escape, primary)
-                });
-            if let Err(error) = result {
-                eprintln!("keyboard dismissal injection failed: {error}");
-            }
-        }
         KeyboardEffect::None => {}
     }
 }
@@ -942,6 +994,7 @@ fn apply_command(
     config: &Config,
     state: &mut ShellState,
     key_injector: &XtestInjector,
+    audio_volume: Option<&AudioVolume>,
 ) {
     match command {
         Command::Ping | Command::State => {}
@@ -989,13 +1042,31 @@ fn apply_command(
                 state.last_action = "swipe_up_close".into();
             }
         }
-        Command::VolumeUp => state.change_volume(5),
-        Command::VolumeDown => state.change_volume(-5),
-        Command::VolumeSet(value) => state.set_volume(value),
+        Command::VolumeUp => change_volume(state, audio_volume, 5),
+        Command::VolumeDown => change_volume(state, audio_volume, -5),
+        Command::VolumeSet(value) => set_volume(state, audio_volume, value),
         Command::Power => state.toggle_screen(),
         Command::ScreenOff => state.screen_off(),
         Command::ScreenOn => state.screen_on(),
         Command::Quit => state.should_exit = true,
+    }
+}
+
+fn change_volume(state: &mut ShellState, audio_volume: Option<&AudioVolume>, delta: i8) {
+    state.change_volume(delta);
+    sync_audio_volume(audio_volume, state.volume);
+}
+
+fn set_volume(state: &mut ShellState, audio_volume: Option<&AudioVolume>, volume: u8) {
+    state.set_volume(volume);
+    sync_audio_volume(audio_volume, state.volume);
+}
+
+fn sync_audio_volume(audio_volume: Option<&AudioVolume>, volume: u8) {
+    if let Some(control) = audio_volume
+        && let Err(error) = control.set(volume)
+    {
+        eprintln!("audio volume sync failed: {error}");
     }
 }
 

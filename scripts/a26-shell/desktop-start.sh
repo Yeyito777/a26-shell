@@ -7,6 +7,7 @@ SERIAL="$(a26_resolve_serial)"
 
 adb -s "$SERIAL" get-state >/dev/null
 if [[ -z "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof Xorg 2>/dev/null || true"' | tr -d '\r')" ]]; then
+    "$PROJECT_ROOT/scripts/a26-shell/audio-start.sh"
     "$PROJECT_ROOT/scripts/start-native-xorg.sh"
 fi
 

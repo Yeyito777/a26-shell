@@ -300,8 +300,7 @@ impl ShellState {
         let effect = self.keyboard.activate(action);
         self.last_action = match action {
             KeyAction::Shift => "keyboard_shift",
-            KeyAction::ToggleLayout => "keyboard_layout",
-            KeyAction::Hide => "keyboard_hide",
+            KeyAction::SwitchLayout(_) => "keyboard_layout",
             KeyAction::Enter => "keyboard_submit",
             KeyAction::Character(_) | KeyAction::Space | KeyAction::Backspace => "keyboard_input",
         }

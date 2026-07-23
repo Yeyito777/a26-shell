@@ -65,6 +65,12 @@ for pid in $(pidof Xorg 2>/dev/null || true); do
     kill -KILL "$pid" 2>/dev/null || true
 done
 
+# The pre-authorized AudioTrack bridge belongs only to the Moon session. Stop
+# its exact recorded process before Android resumes ownership of media policy.
+if [ -x /data/adb/moon/moon-audio-stop.sh ]; then
+    /system/bin/sh /data/adb/moon/moon-audio-stop.sh 2>/dev/null || true
+fi
+
 # Native Wi-Fi owns wlan0 and Android policy table 1023 while Moon is active.
 # Always remove that state before restarting Android's framework/network stack.
 if [ -x /data/local/tmp/a26-wifi-cleanup-android.sh ]; then

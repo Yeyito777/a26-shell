@@ -10,6 +10,7 @@
 
 /src/*
 !/src/a26-shell/
+!/src/a26-audio-bridge/
 /src/a26-shell/target/
 
 /scripts/*
@@ -18,6 +19,9 @@
 /scripts/device/*
 !/scripts/device/90-moon-autostart.sh
 !/scripts/device/moon-boot-supervisor.sh
+!/scripts/device/moon-audio-start.sh
+!/scripts/device/moon-audio-stop.sh
+!/scripts/device/a26-enter-chroot.sh
 !/scripts/device/a26-xorg-takeover.sh
 !/scripts/device/a26-xorg-safety-watchdog.sh
 !/scripts/device/a26-android-graphics-restore.sh
@@ -28,6 +32,7 @@
 !/notes/a26-shell/
 /notes/a26-shell/*
 !/notes/a26-shell/README.md
+!/notes/a26-shell/APPLE-KEYBOARD-LAYOUT.md
 !/notes/a26-shell/launcher-redesign.png
 !/notes/a26-shell/system-view.png
 !/notes/a26-shell/ui-redesign-verification.txt

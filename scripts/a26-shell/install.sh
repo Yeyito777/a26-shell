@@ -9,6 +9,10 @@ CONFIG="$PROJECT_ROOT/build/a26-shell/config.json"
 
 "$PROJECT_ROOT/scripts/a26-shell/build.sh"
 "$PROJECT_ROOT/scripts/a26-shell/generate-config.py" "$CONFIG"
+# Build and install the audio/runtime package before replacing the live shell.
+# A missing JDK, downloader, or first-build network dependency therefore leaves
+# the previously installed Moon shell untouched rather than half-upgraded.
+"$PROJECT_ROOT/scripts/a26-shell/install-audio.sh"
 
 adb -s "$SERIAL" get-state >/dev/null
 adb -s "$SERIAL" push "$IMAGE/bin/a26-shell" /data/local/tmp/a26-shell >/dev/null

@@ -6,8 +6,75 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const EV_KEY: u16 = 0x01;
+const KEY_VOLUME_DOWN: u16 = 114;
+const KEY_VOLUME_UP: u16 = 115;
 const KEY_POWER: u16 = 116;
 const KEY_PRESSED: i32 = 1;
+const KEY_REPEAT: i32 = 2;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum VolumeKey {
+    Down,
+    Up,
+}
+
+/// Direct, non-grabbing volume-key reader. X11 focus and passive grabs are not
+/// reliable enough for system controls once a complex app has descendant
+/// windows, so Moon observes the gpio-keys event node itself.
+pub struct VolumeKeys {
+    file: File,
+    pending: Vec<u8>,
+}
+
+impl VolumeKeys {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(Self {
+            file,
+            pending: Vec::new(),
+        })
+    }
+
+    pub fn poll(&mut self) -> io::Result<Vec<VolumeKey>> {
+        let mut bytes = [0_u8; 24 * 16];
+        loop {
+            match self.file.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => self.pending.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        let timeval_bytes = size_of::<libc::timeval>();
+        let event_bytes = timeval_bytes + 8;
+        let complete = self.pending.len() / event_bytes * event_bytes;
+        let mut keys = Vec::new();
+        for event in self.pending[..complete].chunks_exact(event_bytes) {
+            let kind = u16::from_ne_bytes([event[timeval_bytes], event[timeval_bytes + 1]]);
+            let code = u16::from_ne_bytes([event[timeval_bytes + 2], event[timeval_bytes + 3]]);
+            let value = i32::from_ne_bytes([
+                event[timeval_bytes + 4],
+                event[timeval_bytes + 5],
+                event[timeval_bytes + 6],
+                event[timeval_bytes + 7],
+            ]);
+            if kind != EV_KEY || (value != KEY_PRESSED && value != KEY_REPEAT) {
+                continue;
+            }
+            match code {
+                KEY_VOLUME_DOWN => keys.push(VolumeKey::Down),
+                KEY_VOLUME_UP => keys.push(VolumeKey::Up),
+                _ => {}
+            }
+        }
+        self.pending.drain(..complete);
+        Ok(keys)
+    }
+}
 
 /// Non-grabbing reader for the PMIC power key. Android does not expose this
 /// node to Xorg in the native session, so the shell reads it directly.
@@ -140,5 +207,51 @@ impl Backlight {
             &self.brightness_path,
             format!("{}\n", self.saved_brightness),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: u16, code: u16, value: i32) -> Vec<u8> {
+        let mut bytes = vec![0; size_of::<libc::timeval>()];
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(&code.to_ne_bytes());
+        bytes.extend_from_slice(&value.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn linux_volume_codes_and_repeats_are_stable() {
+        let mut pending = Vec::new();
+        pending.extend(event(EV_KEY, KEY_VOLUME_DOWN, KEY_PRESSED));
+        pending.extend(event(EV_KEY, KEY_VOLUME_UP, KEY_REPEAT));
+        pending.extend(event(EV_KEY, KEY_VOLUME_UP, 0));
+
+        let timeval_bytes = size_of::<libc::timeval>();
+        let event_bytes = timeval_bytes + 8;
+        let keys: Vec<_> = pending
+            .chunks_exact(event_bytes)
+            .filter_map(|raw| {
+                let kind = u16::from_ne_bytes([raw[timeval_bytes], raw[timeval_bytes + 1]]);
+                let code = u16::from_ne_bytes([raw[timeval_bytes + 2], raw[timeval_bytes + 3]]);
+                let value = i32::from_ne_bytes([
+                    raw[timeval_bytes + 4],
+                    raw[timeval_bytes + 5],
+                    raw[timeval_bytes + 6],
+                    raw[timeval_bytes + 7],
+                ]);
+                if kind != EV_KEY || (value != KEY_PRESSED && value != KEY_REPEAT) {
+                    return None;
+                }
+                match code {
+                    KEY_VOLUME_DOWN => Some(VolumeKey::Down),
+                    KEY_VOLUME_UP => Some(VolumeKey::Up),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(keys == [VolumeKey::Down, VolumeKey::Up]);
     }
 }

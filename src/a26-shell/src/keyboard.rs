@@ -14,16 +14,19 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 use crate::font;
 use crate::ui::{ACCENT, ACCENT_2, BG, BG_CARD, MUTED};
 
-pub const KEYBOARD_HEIGHT: u16 = 1240;
+// Apple does not publish fixed software-keyboard frames. These dimensions use
+// the standard 390-point iPhone portrait keyboard as a proportional reference
+// and scale to Moon's 1080-pixel-wide display. The final 180 physical pixels
+// remain Moon's app-close start zone, analogous to the iPhone bottom safe area.
+pub const KEYBOARD_HEIGHT: u16 = 820;
 pub const CLOSE_START_ZONE_HEIGHT: u16 = 180;
 const REFERENCE_KEY_AREA_HEIGHT: u16 = KEYBOARD_HEIGHT - CLOSE_START_ZONE_HEIGHT;
-const ROW_Y: [u16; 5] = [16, 218, 420, 622, 824];
-const ROW_HEIGHT: [u16; 5] = [184, 184, 184, 184, 216];
-const HORIZONTAL_MARGIN: u16 = 16;
-const KEY_GAP: u16 = 8;
+const REFERENCE_SCREEN_WIDTH: u16 = 1080;
+const ROW_Y: [u16; 4] = [18, 166, 314, 462];
+const ROW_HEIGHT: [u16; 4] = [132, 132, 132, 160];
+const KEY_GAP: u16 = 10;
 
 const XK_BACK_SPACE: Keysym = 0xff08;
-const XK_ESCAPE: Keysym = 0xff1b;
 const XK_RETURN: Keysym = 0xff0d;
 const XK_SHIFT_L: Keysym = 0xffe1;
 const XK_SHIFT_R: Keysym = 0xffe2;
@@ -66,7 +69,9 @@ impl KeyboardPurpose {
 #[serde(rename_all = "snake_case")]
 pub enum KeyboardLayout {
     Letters,
+    Numbers,
     Symbols,
+    NumberPad,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -106,7 +111,7 @@ impl KeyboardState {
         self.purpose = Some(purpose);
         self.shift = false;
         self.layout = if purpose == KeyboardPurpose::Number {
-            KeyboardLayout::Symbols
+            KeyboardLayout::NumberPad
         } else {
             KeyboardLayout::Letters
         };
@@ -201,25 +206,21 @@ impl KeyboardState {
                 KeyboardEffect::None
             }
             KeyAction::Shift => KeyboardEffect::None,
-            KeyAction::ToggleLayout if self.purpose != Some(KeyboardPurpose::Number) => {
-                self.layout = match self.layout {
-                    KeyboardLayout::Letters => KeyboardLayout::Symbols,
-                    KeyboardLayout::Symbols => KeyboardLayout::Letters,
-                };
+            KeyAction::SwitchLayout(layout)
+                if self.purpose != Some(KeyboardPurpose::Number)
+                    && layout != KeyboardLayout::NumberPad =>
+            {
+                self.layout = layout;
                 self.shift = false;
                 self.redraw = true;
                 KeyboardEffect::None
             }
-            KeyAction::ToggleLayout => KeyboardEffect::None,
+            KeyAction::SwitchLayout(_) => KeyboardEffect::None,
             KeyAction::Space => KeyboardEffect::Inject(KeyboardInput::Character(' ')),
             KeyAction::Backspace => KeyboardEffect::Inject(KeyboardInput::Backspace),
             KeyAction::Enter => {
                 self.hide();
                 KeyboardEffect::Inject(KeyboardInput::Enter)
-            }
-            KeyAction::Hide => {
-                self.hide();
-                KeyboardEffect::Hide
             }
         }
     }
@@ -229,11 +230,10 @@ impl KeyboardState {
 pub enum KeyAction {
     Character(char),
     Shift,
-    ToggleLayout,
+    SwitchLayout(KeyboardLayout),
     Space,
     Backspace,
     Enter,
-    Hide,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -241,14 +241,12 @@ pub enum KeyboardInput {
     Character(char),
     Backspace,
     Enter,
-    Escape,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardEffect {
     None,
     Inject(KeyboardInput),
-    Hide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,10 +337,11 @@ impl KeyboardGeometry {
 
     pub fn keys(&self, state: &KeyboardState) -> Vec<KeyboardKey> {
         let mut keys = Vec::with_capacity(48);
-        if state.layout() == KeyboardLayout::Letters {
-            self.add_letter_keys(state, &mut keys);
-        } else {
-            self.add_symbol_keys(state, &mut keys);
+        match state.layout() {
+            KeyboardLayout::Letters => self.add_letter_keys(state, &mut keys),
+            KeyboardLayout::Numbers => self.add_number_keys(state, &mut keys),
+            KeyboardLayout::Symbols => self.add_symbol_keys(state, &mut keys),
+            KeyboardLayout::NumberPad => self.add_number_pad_keys(&mut keys),
         }
         keys
     }
@@ -351,6 +350,7 @@ impl KeyboardGeometry {
         self.add_row(
             keys,
             0,
+            16,
             &[
                 ("Q", KeyAction::Character('q'), 10),
                 ("W", KeyAction::Character('w'), 10),
@@ -367,6 +367,7 @@ impl KeyboardGeometry {
         self.add_row(
             keys,
             1,
+            64,
             &[
                 ("A", KeyAction::Character('a'), 10),
                 ("S", KeyAction::Character('s'), 10),
@@ -382,8 +383,9 @@ impl KeyboardGeometry {
         self.add_row(
             keys,
             2,
+            16,
             &[
-                ("SHIFT", KeyAction::Shift, 15),
+                ("SHIFT", KeyAction::Shift, 13),
                 ("Z", KeyAction::Character('z'), 10),
                 ("X", KeyAction::Character('x'), 10),
                 ("C", KeyAction::Character('c'), 10),
@@ -391,43 +393,17 @@ impl KeyboardGeometry {
                 ("B", KeyAction::Character('b'), 10),
                 ("N", KeyAction::Character('n'), 10),
                 ("M", KeyAction::Character('m'), 10),
-                ("DEL", KeyAction::Backspace, 15),
+                ("DEL", KeyAction::Backspace, 13),
             ],
         );
-        self.add_row(
-            keys,
-            3,
-            &[
-                (".", KeyAction::Character('.'), 10),
-                ("/", KeyAction::Character('/'), 10),
-                (":", KeyAction::Character(':'), 10),
-                ("-", KeyAction::Character('-'), 10),
-                ("_", KeyAction::Character('_'), 10),
-            ],
-        );
-        self.add_row(
-            keys,
-            4,
-            &[
-                ("123", KeyAction::ToggleLayout, 15),
-                ("SPACE", KeyAction::Space, 42),
-                (
-                    state
-                        .purpose()
-                        .unwrap_or(KeyboardPurpose::Text)
-                        .submit_label(),
-                    KeyAction::Enter,
-                    23,
-                ),
-                ("HIDE", KeyAction::Hide, 15),
-            ],
-        );
+        self.add_bottom_row(state, keys, KeyboardLayout::Numbers, "123");
     }
 
-    fn add_symbol_keys(&self, state: &KeyboardState, keys: &mut Vec<KeyboardKey>) {
+    fn add_number_keys(&self, state: &KeyboardState, keys: &mut Vec<KeyboardKey>) {
         self.add_row(
             keys,
             0,
+            16,
             &[
                 ("1", KeyAction::Character('1'), 10),
                 ("2", KeyAction::Character('2'), 10),
@@ -444,71 +420,150 @@ impl KeyboardGeometry {
         self.add_row(
             keys,
             1,
+            16,
             &[
-                ("@", KeyAction::Character('@'), 10),
-                ("#", KeyAction::Character('#'), 10),
-                ("$", KeyAction::Character('$'), 10),
-                ("%", KeyAction::Character('%'), 10),
-                ("&", KeyAction::Character('&'), 10),
-                ("*", KeyAction::Character('*'), 10),
+                ("-", KeyAction::Character('-'), 10),
+                ("/", KeyAction::Character('/'), 10),
+                (":", KeyAction::Character(':'), 10),
+                (";", KeyAction::Character(';'), 10),
                 ("(", KeyAction::Character('('), 10),
                 (")", KeyAction::Character(')'), 10),
+                ("$", KeyAction::Character('$'), 10),
+                ("&", KeyAction::Character('&'), 10),
+                ("@", KeyAction::Character('@'), 10),
+                ("\"", KeyAction::Character('"'), 10),
             ],
         );
         self.add_row(
             keys,
             2,
+            16,
             &[
-                ("!", KeyAction::Character('!'), 10),
-                ("\"", KeyAction::Character('"'), 10),
-                ("'", KeyAction::Character('\''), 10),
-                (";", KeyAction::Character(';'), 10),
-                (":", KeyAction::Character(':'), 10),
+                ("#+=", KeyAction::SwitchLayout(KeyboardLayout::Symbols), 16),
+                (".", KeyAction::Character('.'), 10),
+                (",", KeyAction::Character(','), 10),
                 ("?", KeyAction::Character('?'), 10),
-                ("DEL", KeyAction::Backspace, 15),
+                ("!", KeyAction::Character('!'), 10),
+                ("'", KeyAction::Character('\''), 10),
+                ("DEL", KeyAction::Backspace, 16),
+            ],
+        );
+        self.add_bottom_row(state, keys, KeyboardLayout::Letters, "ABC");
+    }
+
+    fn add_symbol_keys(&self, state: &KeyboardState, keys: &mut Vec<KeyboardKey>) {
+        self.add_row(
+            keys,
+            0,
+            16,
+            &[
+                ("[", KeyAction::Character('['), 10),
+                ("]", KeyAction::Character(']'), 10),
+                ("{", KeyAction::Character('{'), 10),
+                ("}", KeyAction::Character('}'), 10),
+                ("#", KeyAction::Character('#'), 10),
+                ("%", KeyAction::Character('%'), 10),
+                ("^", KeyAction::Character('^'), 10),
+                ("*", KeyAction::Character('*'), 10),
+                ("+", KeyAction::Character('+'), 10),
+                ("=", KeyAction::Character('='), 10),
             ],
         );
         self.add_row(
             keys,
-            3,
+            1,
+            64,
             &[
-                ("-", KeyAction::Character('-'), 10),
                 ("_", KeyAction::Character('_'), 10),
-                ("/", KeyAction::Character('/'), 10),
-                ("+", KeyAction::Character('+'), 10),
-                ("=", KeyAction::Character('='), 10),
-                (".", KeyAction::Character('.'), 10),
-                (",", KeyAction::Character(','), 10),
+                ("\\", KeyAction::Character('\\'), 10),
+                ("|", KeyAction::Character('|'), 10),
+                ("~", KeyAction::Character('~'), 10),
+                ("<", KeyAction::Character('<'), 10),
+                (">", KeyAction::Character('>'), 10),
+                ("$", KeyAction::Character('$'), 10),
+                ("&", KeyAction::Character('&'), 10),
+                ("@", KeyAction::Character('@'), 10),
             ],
         );
-        if state.purpose() == Some(KeyboardPurpose::Number) {
+        self.add_row(
+            keys,
+            2,
+            16,
+            &[
+                ("123", KeyAction::SwitchLayout(KeyboardLayout::Numbers), 16),
+                (".", KeyAction::Character('.'), 10),
+                (",", KeyAction::Character(','), 10),
+                ("?", KeyAction::Character('?'), 10),
+                ("!", KeyAction::Character('!'), 10),
+                ("'", KeyAction::Character('\''), 10),
+                ("DEL", KeyAction::Backspace, 16),
+            ],
+        );
+        self.add_bottom_row(state, keys, KeyboardLayout::Letters, "ABC");
+    }
+
+    fn add_number_pad_keys(&self, keys: &mut Vec<KeyboardKey>) {
+        for (row, definitions) in [
+            [
+                ("1", KeyAction::Character('1'), 10),
+                ("2", KeyAction::Character('2'), 10),
+                ("3", KeyAction::Character('3'), 10),
+            ],
+            [
+                ("4", KeyAction::Character('4'), 10),
+                ("5", KeyAction::Character('5'), 10),
+                ("6", KeyAction::Character('6'), 10),
+            ],
+            [
+                ("7", KeyAction::Character('7'), 10),
+                ("8", KeyAction::Character('8'), 10),
+                ("9", KeyAction::Character('9'), 10),
+            ],
+            [
+                (".", KeyAction::Character('.'), 10),
+                ("0", KeyAction::Character('0'), 10),
+                ("DEL", KeyAction::Backspace, 10),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.add_row(keys, row, 132, &definitions);
+        }
+    }
+
+    fn add_bottom_row(
+        &self,
+        state: &KeyboardState,
+        keys: &mut Vec<KeyboardKey>,
+        switch_to: KeyboardLayout,
+        switch_label: &'static str,
+    ) {
+        let submit = state
+            .purpose()
+            .unwrap_or(KeyboardPurpose::Text)
+            .submit_label();
+        if state.purpose() == Some(KeyboardPurpose::Url) {
             self.add_row(
                 keys,
-                4,
+                3,
+                16,
                 &[
-                    ("0", KeyAction::Character('0'), 25),
-                    (".", KeyAction::Character('.'), 15),
-                    ("-", KeyAction::Character('-'), 15),
-                    ("DONE", KeyAction::Enter, 25),
-                    ("HIDE", KeyAction::Hide, 20),
+                    (switch_label, KeyAction::SwitchLayout(switch_to), 18),
+                    ("SPACE", KeyAction::Space, 48),
+                    (".", KeyAction::Character('.'), 12),
+                    (submit, KeyAction::Enter, 22),
                 ],
             );
         } else {
             self.add_row(
                 keys,
-                4,
+                3,
+                16,
                 &[
-                    ("ABC", KeyAction::ToggleLayout, 15),
-                    ("SPACE", KeyAction::Space, 42),
-                    (
-                        state
-                            .purpose()
-                            .unwrap_or(KeyboardPurpose::Text)
-                            .submit_label(),
-                        KeyAction::Enter,
-                        23,
-                    ),
-                    ("HIDE", KeyAction::Hide, 15),
+                    (switch_label, KeyAction::SwitchLayout(switch_to), 20),
+                    ("SPACE", KeyAction::Space, 60),
+                    (submit, KeyAction::Enter, 20),
                 ],
             );
         }
@@ -518,6 +573,7 @@ impl KeyboardGeometry {
         &self,
         output: &mut Vec<KeyboardKey>,
         row: usize,
+        reference_margin: u16,
         definitions: &[(&'static str, KeyAction, u16)],
     ) {
         if definitions.is_empty() || self.key_area_height == 0 {
@@ -529,8 +585,12 @@ impl KeyboardGeometry {
         };
         let y = scale_y(ROW_Y[row]) as i16;
         let height = scale_y(ROW_HEIGHT[row]) as u16;
-        let margin = HORIZONTAL_MARGIN.min(self.screen_width / 8);
-        let gaps = KEY_GAP.saturating_mul(definitions.len().saturating_sub(1) as u16);
+        let scale_x = |value: u16| {
+            u32::from(value) * u32::from(self.screen_width) / u32::from(REFERENCE_SCREEN_WIDTH)
+        };
+        let margin = (scale_x(reference_margin) as u16).min(self.screen_width / 3);
+        let gap = (scale_x(KEY_GAP) as u16).max(1);
+        let gaps = gap.saturating_mul(definitions.len().saturating_sub(1) as u16);
         let available = self
             .screen_width
             .saturating_sub(margin.saturating_mul(2))
@@ -559,7 +619,7 @@ impl KeyboardGeometry {
                 label,
                 action,
             });
-            x = x.saturating_add(width).saturating_add(KEY_GAP);
+            x = x.saturating_add(width).saturating_add(gap);
             remaining_width = remaining_width.saturating_sub(width);
             remaining_weight = remaining_weight.saturating_sub(u32::from(weight));
         }
@@ -696,7 +756,7 @@ impl KeyboardSurface {
             let outline = match key.action {
                 KeyAction::Enter => ACCENT,
                 KeyAction::Shift if state.shift() => ACCENT,
-                KeyAction::Hide | KeyAction::Backspace => MUTED,
+                KeyAction::Backspace => MUTED,
                 _ => ACCENT_2,
             };
             self.fill(conn, BG_CARD, key.rect.xproto())?;
@@ -878,7 +938,6 @@ impl XtestInjector {
             }
             KeyboardInput::Backspace => XK_BACK_SPACE,
             KeyboardInput::Enter => XK_RETURN,
-            KeyboardInput::Escape => XK_ESCAPE,
         };
         let resolved = mapping
             .resolve(keysym)
@@ -1123,12 +1182,20 @@ mod tests {
     #[test]
     fn url_layout_has_contextual_submit_and_required_punctuation() {
         let geometry = KeyboardGeometry::new(1080, 2340);
-        let state = visible(KeyboardPurpose::Url);
-        let keys = geometry.keys(&state);
+        let mut state = visible(KeyboardPurpose::Url);
+        let mut keys = geometry.keys(&state);
         assert!(
             keys.iter()
                 .any(|key| key.label == "GO" && key.action == KeyAction::Enter)
         );
+        assert!(
+            keys.iter()
+                .any(|key| key.action == KeyAction::Character('.'))
+        );
+        state.activate(KeyAction::SwitchLayout(KeyboardLayout::Numbers));
+        keys.extend(geometry.keys(&state));
+        state.activate(KeyAction::SwitchLayout(KeyboardLayout::Symbols));
+        keys.extend(geometry.keys(&state));
         for character in ['.', '/', ':', '-', '_'] {
             assert!(
                 keys.iter()
@@ -1145,7 +1212,6 @@ mod tests {
             (KeyboardPurpose::Url, "GO"),
             (KeyboardPurpose::Search, "SEARCH"),
             (KeyboardPurpose::Password, "DONE"),
-            (KeyboardPurpose::Number, "DONE"),
         ] {
             let state = visible(purpose);
             assert!(
@@ -1159,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_is_one_shot_and_number_starts_on_symbols() {
+    fn shift_is_one_shot_and_number_starts_on_number_pad() {
         let mut state = visible(KeyboardPurpose::Text);
         assert!(matches!(
             state.activate(KeyAction::Shift),
@@ -1173,9 +1239,72 @@ mod tests {
         assert!(!state.shift());
 
         state.show(KeyboardPurpose::Number);
-        assert_eq!(state.layout(), KeyboardLayout::Symbols);
-        state.activate(KeyAction::ToggleLayout);
-        assert_eq!(state.layout(), KeyboardLayout::Symbols);
+        assert_eq!(state.layout(), KeyboardLayout::NumberPad);
+        state.activate(KeyAction::SwitchLayout(KeyboardLayout::Letters));
+        assert_eq!(state.layout(), KeyboardLayout::NumberPad);
+    }
+
+    #[test]
+    fn letter_rows_follow_iphone_us_portrait_stagger() {
+        let geometry = KeyboardGeometry::new(1080, 2340);
+        let state = visible(KeyboardPurpose::Text);
+        let keys = geometry.keys(&state);
+        let rows: Vec<Vec<&KeyboardKey>> = ROW_Y
+            .iter()
+            .map(|y| keys.iter().filter(|key| key.rect.y == *y as i16).collect())
+            .collect();
+
+        assert_eq!(
+            rows[0].iter().map(|key| key.label).collect::<String>(),
+            "QWERTYUIOP"
+        );
+        assert_eq!(
+            rows[1].iter().map(|key| key.label).collect::<String>(),
+            "ASDFGHJKL"
+        );
+        assert_eq!(rows[2].len(), 9);
+        assert_eq!(rows[2][0].label, "SHIFT");
+        assert_eq!(rows[2][8].label, "DEL");
+        assert_eq!(
+            rows[3].iter().map(|key| key.label).collect::<Vec<_>>(),
+            ["123", "SPACE", "DONE"]
+        );
+        assert!(rows[1][0].rect.x > rows[0][0].rect.x);
+        assert!(rows[2][0].rect.width > rows[2][1].rect.width);
+        assert!(rows[2][8].rect.width > rows[2][7].rect.width);
+    }
+
+    #[test]
+    fn number_and_symbol_pages_follow_iphone_key_order() {
+        let geometry = KeyboardGeometry::new(1080, 2340);
+        let mut state = visible(KeyboardPurpose::Text);
+        state.activate(KeyAction::SwitchLayout(KeyboardLayout::Numbers));
+        let numbers = geometry.keys(&state);
+        assert_eq!(
+            numbers
+                .iter()
+                .take(10)
+                .map(|key| key.label)
+                .collect::<String>(),
+            "1234567890"
+        );
+        assert!(numbers.iter().any(|key| {
+            key.label == "#+=" && key.action == KeyAction::SwitchLayout(KeyboardLayout::Symbols)
+        }));
+
+        state.activate(KeyAction::SwitchLayout(KeyboardLayout::Symbols));
+        let symbols = geometry.keys(&state);
+        assert_eq!(
+            symbols
+                .iter()
+                .take(10)
+                .map(|key| key.label)
+                .collect::<String>(),
+            "[]{}#%^*+="
+        );
+        assert!(symbols.iter().any(|key| {
+            key.label == "123" && key.action == KeyAction::SwitchLayout(KeyboardLayout::Numbers)
+        }));
     }
 
     #[test]

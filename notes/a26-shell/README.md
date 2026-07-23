@@ -13,9 +13,11 @@ the Samsung Galaxy A26 (SM-A266M).
 - separately managed `a26-system` application with device/Linux information,
   live CPU/GPU utilization, and used/remaining filesystem space;
 - bottom-edge gesture bar inside System, where swiping up closes the app;
-- volume overlay and root-only ADB/Unix-socket development controls.
+- focus-independent physical volume keys, a global volume overlay, real
+  AudioTrack-backed app audio, and root-only ADB/Unix-socket controls.
 - global Moon-owned on-screen keyboard in a dedicated X11 window, with XTEST
-  delivery to the focused managed app and a key-free bottom close zone.
+  delivery to the focused managed app, an iPhone-compatible English (US)
+  four-row layout, and a key-free bottom close zone.
 
 ## Captured output
 
@@ -51,6 +53,11 @@ Pixel-level layout checks are recorded in
   matching Xorg safety token, Moon reached its lock screen without a host start
   command, native Wi-Fi re-associated, and the persistent failure counter reset
   to zero
+- autonomous audio boot from a controlled full reboot: the system-UID bridge
+  was authorized before framework suspension, its PID/FIFO survived the handoff,
+  Browser PCM reached a 48 kHz stereo AudioFlinger speaker track, and GPIO volume
+  changes updated both Moon state and the bridge gain while Browser/System owned
+  X focus
 - Android fallback policy for a preceding kernel panic, three failed starts,
   explicit disable/skip-once markers, a post-boot volume-key override, and an
   8% low-battery threshold

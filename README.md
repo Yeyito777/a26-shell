@@ -32,6 +32,7 @@ key policy, and a root-only Unix-socket control interface over ADB.
 
 ```text
 src/a26-shell/          Rust window-manager crate
+src/a26-audio-bridge/   Minimal Android AudioTrack bridge source
 scripts/a26-shell/      build, install, lifecycle, IPC, and test helpers
 notes/a26-shell/        curated screenshots and design verification
 ```
@@ -39,14 +40,18 @@ notes/a26-shell/        curated screenshots and design verification
 ## Build
 
 Host requirements include a current Rust toolchain, the
-`aarch64-unknown-linux-musl` target, `aarch64-linux-musl-gcc`, and ADB.
+`aarch64-unknown-linux-musl` target, `aarch64-linux-musl-gcc`, ADB, `curl`,
+`unzip`, and a JDK providing `javac`, `java`, and `jar`. The first audio-bridge
+build downloads pinned Android platform and R8 inputs; subsequent builds use
+the ignored local cache under `build/a26-audio-bridge/`.
 
 ```sh
 scripts/a26-shell/build.sh
 ```
 
 Generated binaries and source archives are written under
-`images/a26-shell-0.1.0/` and intentionally ignored by Git.
+`images/a26-shell-0.1.0/` and `images/a26-audio-bridge/` and are intentionally
+ignored by Git.
 
 ## Device installation
 
@@ -100,8 +105,9 @@ scripts/a26-shell/autostart.sh status
 ```
 
 The Magisk `service.d` entry waits for Android/vendor initialization and data
-decryption, then performs the proven DRM handoff, verifies Xorg locally, starts
-Moon, and monitors the session without a host computer. Android remains active
+decryption, pre-authorizes Moon's AudioTrack bridge, then performs the proven DRM
+handoff, verifies Xorg locally, starts Moon, and monitors the session without a
+host computer. Android remains active
 instead when the preceding boot was a kernel panic, required hardware is
 missing, startup repeatedly fails, or the battery is too low. At runtime Moon
 returns to Android charging mode at 8% rather than reaching PMIC undervoltage
@@ -141,8 +147,8 @@ authorized ADB host can bypass it by design.
   a general manifest/discovery protocol is the next launcher milestone.
 - Touch taps and one-finger swipes work; multitouch/pinch policy is not yet
   implemented.
-- Volume is currently shell policy/UI state; a native application-audio mixer
-  backend remains to be added.
+- Audio currently targets the built-in speaker through Android's native
+  AudioFlinger/HAL services; Bluetooth and USB audio routing are not yet exposed.
 - The native Xorg/DRM takeover environment must be prepared separately.
 
 ## License

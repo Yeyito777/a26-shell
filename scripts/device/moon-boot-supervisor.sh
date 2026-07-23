@@ -161,6 +161,8 @@ for required in \
     "$ROOT/a26-enter-chroot.sh" \
     "$ROOT/opt/a26-shell/bin/a26-shell" \
     "$ROOT/opt/a26-shell/bin/a26-shellctl" \
+    "$PERSIST/moon-audio-start.sh" \
+    "$PERSIST/moon-audio-stop.sh" \
     /data/local/tmp/a26-xorg-takeover.sh \
     /data/local/tmp/a26-xorg-safety-watchdog.sh \
     /data/local/tmp/a26-android-graphics-restore.sh \
@@ -171,6 +173,17 @@ do
         exit 21
     }
 done
+[ -r "$ROOT/opt/a26-audio/moon-audio-bridge.jar" ] || {
+    log 'required audio bridge JAR is unreadable'
+    exit 21
+}
+
+if ! /system/bin/sh "$PERSIST/moon-audio-start.sh"; then
+    log 'audio bridge did not become ready; leaving Android active'
+    /system/bin/sh "$PERSIST/moon-audio-stop.sh" 2>/dev/null || true
+    exit 22
+fi
+log "audio bridge ready pid=$(cat /data/local/tmp/moon-audio/bridge.pid 2>/dev/null || true)"
 
 failures=$((failures + 1))
 write_uint "$PERSIST/start-failures" "$failures"

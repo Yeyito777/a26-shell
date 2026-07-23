@@ -17,7 +17,8 @@ Current features:
 - bottom-edge swipe-up app close gesture;
 - system-owned global on-screen keyboard for managed apps, with text, URL,
   search, password, and number purposes;
-- volume-key handling and volume overlay;
+- focus-independent physical volume-key handling, a global volume overlay, and
+  real application-audio gain control;
 - physical power-key lock/screen blanking with panel-backlight control;
 - ordinary X11 `MapRequest`/`ConfigureRequest` handling;
 - root-only Unix-socket IPC for state inspection and deterministic input;
@@ -45,6 +46,7 @@ Runtime paths on the phone:
 /opt/a26-shell/bin/a26-shellshot
 /etc/a26-shell/config.json
 /run/a26-shell/control.sock
+/run/moon-audio/{pcm,volume,bridge.pid}
 /root/a26-shell.log
 ```
 
@@ -52,8 +54,24 @@ Useful host controls include `state`, `lock`, `screen on`, `screen off`,
 `launch system`, `launch browser`, `keyboard show url`, `keyboard hide`,
 `swipe-up`, `volume up`, and pointer/tap injection. They are exposed through
 `scripts/a26-shell/ctl.sh` and the root-only Unix socket.
-`scripts/a26-shell/screenshot.sh` captures the actual X11 shell window over
-ADB without relying on Android SurfaceFlinger.
+`scripts/a26-shell/screenshot.sh` captures the composed X11 root screen over ADB
+without relying on Android SurfaceFlinger.
+
+## Native-session audio
+
+Samsung's AudioFlinger and audio HAL remain alive when Moon suspends the Android
+Java framework, but a new AudioTrack cannot be authorized after PackageManager,
+PermissionManager, and AudioService stop. The autonomous supervisor therefore
+starts a small system-UID Java bridge before the DRM handoff. Its already-created
+48 kHz stereo AudioTrack remains valid after `system_server` exits.
+
+Linux applications write signed 16-bit PCM to the root/system-only
+`/run/moon-audio/pcm` FIFO. Moon writes its 0–100 gain to the adjacent volume
+file. The physical GPIO volume keys are read directly from `/dev/input/event0`,
+so their behavior does not depend on which app or descendant X11 window has
+focus. A dedicated override-redirect volume surface provides feedback above
+both System and Browser. Browser's private rootfs sees only this FIFO; it still
+does not receive the phone's `/dev/snd` or unsafe camera devices.
 
 ## On-screen keyboard protocol
 
@@ -62,6 +80,15 @@ lower-screen override-redirect X11 window above the active managed app. Moon's
 existing XI2 raw-touch path consumes touches in the key panel before its normal
 app tap forwarding. The bottom 180 physical pixels contain no keys and remain
 available as the global swipe-to-close start zone.
+
+English (US) uses the familiar four-row iPhone portrait arrangement: staggered
+QWERTY letter rows, wider Shift/Delete controls, standard `123` and `#+=`
+layers, a dedicated number pad, and contextual Done/Search/Go keys. URL entry
+uses the Safari-style `123`, Space, `.`, Go bottom row. Moon preserves its own
+visual language while scaling geometry proportionally from a 390-point iPhone
+width reference. Apple does not publish fixed system-keyboard rectangles;
+measurements and source references are recorded in
+`notes/a26-shell/APPLE-KEYBOARD-LAYOUT.md`.
 
 Managed apps request keyboard state with one command on the existing control
 socket, read the JSON response, and close the connection:
@@ -80,8 +107,8 @@ key through XTEST using the server keyboard and modifier maps. A short physical
 press interval is retained between key down and key up. The Browser target has a
 narrow A26-only CEF compatibility path that turns the resulting raw printable key
 into the missing renderer CHAR event; no typed value crosses IPC or enters a Moon
-buffer. HIDE also emits one Escape after unmapping so clients can end editing and
-a later tap on the same field can request the keyboard again.
+buffer. A managed app can dismiss the keyboard explicitly over IPC or by ending
+its editable-field focus; Moon also hides it on every security/app transition.
 
 App taps use XTEST pointer injection as well. This lets the X server hit-test into
 embedded descendant windows such as Chromium's page surface instead of sending a
@@ -120,6 +147,10 @@ scripts/a26-shell/ctl.sh state
 scripts/a26-shell/desktop-stop.sh
 ```
 
+`install.sh` also installs the AudioTrack bridge and the chroot/runtime helpers
+required by `desktop-start.sh`; enabling autonomous boot remains a separate,
+explicit `install-autostart.sh` operation.
+
 ### Autonomous boot
 
 The phone can boot into Moon without a host-side ADB command. Android and the
@@ -139,6 +170,7 @@ Safety policy:
 - require at least 20% battery before takeover;
 - restore Android charging mode at 8%;
 - verify Xorg and Moon using phone-local status/control paths;
+- authorize and verify the AudioTrack bridge before suspending system_server;
 - clean native Wi-Fi before restoring Android;
 - press a volume key during the eight-second override window to skip Moon once;
 - use `autostart.sh skip-once|disable|enable` for explicit host control.
