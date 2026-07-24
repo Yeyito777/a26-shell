@@ -10,6 +10,8 @@ pub struct Config {
     pub pin_length: usize,
     pub start_locked: bool,
     pub initial_volume: u8,
+    pub keyboard_repeat_delay_ms: u64,
+    pub keyboard_repeat_rate_hz: u32,
     pub socket_path: PathBuf,
 }
 
@@ -23,6 +25,10 @@ struct ConfigFile {
     start_locked: bool,
     #[serde(default = "default_volume")]
     initial_volume: u8,
+    #[serde(default = "default_keyboard_repeat_delay_ms")]
+    keyboard_repeat_delay_ms: u64,
+    #[serde(default = "default_keyboard_repeat_rate_hz")]
+    keyboard_repeat_rate_hz: u32,
     #[serde(default = "default_socket")]
     socket_path: PathBuf,
 }
@@ -35,6 +41,12 @@ fn default_true() -> bool {
 }
 fn default_volume() -> u8 {
     50
+}
+fn default_keyboard_repeat_delay_ms() -> u64 {
+    200
+}
+fn default_keyboard_repeat_rate_hz() -> u32 {
+    45
 }
 fn default_socket() -> PathBuf {
     "/run/a26-shell/control.sock".into()
@@ -55,12 +67,20 @@ impl Config {
         if !(4..=12).contains(&file.pin_length) {
             return Err("PIN length must be between 4 and 12".into());
         }
+        if !(50..=2_000).contains(&file.keyboard_repeat_delay_ms) {
+            return Err("keyboard repeat delay must be between 50 and 2000 ms".into());
+        }
+        if !(1..=100).contains(&file.keyboard_repeat_rate_hz) {
+            return Err("keyboard repeat rate must be between 1 and 100 Hz".into());
+        }
         Ok(Self {
             pin_salt,
             pin_hash,
             pin_length: file.pin_length,
             start_locked: file.start_locked,
             initial_volume: file.initial_volume.min(100),
+            keyboard_repeat_delay_ms: file.keyboard_repeat_delay_ms,
+            keyboard_repeat_rate_hz: file.keyboard_repeat_rate_hz,
             socket_path: file.socket_path,
         })
     }

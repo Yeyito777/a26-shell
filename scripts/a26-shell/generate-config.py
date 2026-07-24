@@ -23,6 +23,9 @@ config = {
     "pin_length": 6,
     "start_locked": True,
     "initial_volume": 50,
+    # Match the workstation's `xset r rate 200 45` configuration.
+    "keyboard_repeat_delay_ms": 200,
+    "keyboard_repeat_rate_hz": 45,
     "socket_path": "/run/a26-shell/control.sock",
 }
 
@@ -30,4 +33,3 @@ output = pathlib.Path(sys.argv[1])
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps(config, indent=2) + "\n")
 output.chmod(0o600)
-

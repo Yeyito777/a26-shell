@@ -12,7 +12,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
 use crate::font;
-use crate::ui::{ACCENT, ACCENT_2, BG, BG_CARD, MUTED};
+use crate::ui::{ACCENT, ACCENT_2, BG, BG_CARD, FG, MUTED};
 
 // Apple does not publish fixed software-keyboard frames. These dimensions use
 // the standard 390-point iPhone portrait keyboard as a proportional reference
@@ -88,6 +88,7 @@ pub struct KeyboardState {
     purpose: Option<KeyboardPurpose>,
     shift: bool,
     layout: KeyboardLayout,
+    pressed_key_indices: Vec<usize>,
     redraw: bool,
     raise_pending: bool,
 }
@@ -99,6 +100,7 @@ impl Default for KeyboardState {
             purpose: None,
             shift: false,
             layout: KeyboardLayout::Letters,
+            pressed_key_indices: Vec::new(),
             redraw: false,
             raise_pending: false,
         }
@@ -115,6 +117,7 @@ impl KeyboardState {
         } else {
             KeyboardLayout::Letters
         };
+        self.pressed_key_indices.clear();
         self.redraw = true;
         self.raise_pending = true;
     }
@@ -125,6 +128,7 @@ impl KeyboardState {
         self.purpose = None;
         self.shift = false;
         self.layout = KeyboardLayout::Letters;
+        self.pressed_key_indices.clear();
         self.redraw = false;
         self.raise_pending = false;
         was_visible
@@ -153,6 +157,26 @@ impl KeyboardState {
 
     pub fn shift(&self) -> bool {
         self.shift
+    }
+
+    pub fn press_key_index(&mut self, index: usize) {
+        self.pressed_key_indices.push(index);
+        self.request_redraw();
+    }
+
+    pub fn release_key_index(&mut self, index: usize) {
+        if let Some(position) = self
+            .pressed_key_indices
+            .iter()
+            .position(|pressed| *pressed == index)
+        {
+            self.pressed_key_indices.remove(position);
+            self.request_redraw();
+        }
+    }
+
+    pub fn is_key_pressed(&self, index: usize) -> bool {
+        self.pressed_key_indices.contains(&index)
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -234,6 +258,12 @@ pub enum KeyAction {
     Space,
     Backspace,
     Enter,
+}
+
+impl KeyAction {
+    pub fn is_repeatable(self) -> bool {
+        matches!(self, Self::Character(_) | Self::Space | Self::Backspace)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -752,16 +782,30 @@ impl KeyboardSurface {
             },
         )?;
 
-        for key in self.geometry.keys(state) {
-            let outline = match key.action {
-                KeyAction::Enter => ACCENT,
-                KeyAction::Shift if state.shift() => ACCENT,
-                KeyAction::Backspace => MUTED,
-                _ => ACCENT_2,
+        for (index, key) in self.geometry.keys(state).into_iter().enumerate() {
+            let pressed = state.is_key_pressed(index);
+            let outline = if pressed {
+                ACCENT
+            } else {
+                match key.action {
+                    KeyAction::Enter => ACCENT,
+                    KeyAction::Shift if state.shift() => ACCENT,
+                    KeyAction::Backspace => MUTED,
+                    _ => ACCENT_2,
+                }
             };
-            self.fill(conn, BG_CARD, key.rect.xproto())?;
+            self.fill(
+                conn,
+                if pressed { ACCENT_2 } else { BG_CARD },
+                key.rect.xproto(),
+            )?;
             self.outline(conn, outline, key.rect.xproto(), 3)?;
-            self.center_key_label(conn, key.label, key.rect, outline)?;
+            self.center_key_label(
+                conn,
+                key.label,
+                key.rect,
+                if pressed { FG } else { outline },
+            )?;
         }
 
         let cue_width = self.geometry.screen_width.min(260);
@@ -985,6 +1029,63 @@ impl XtestInjector {
         Ok(())
     }
 
+    /// Emit a bounded repeat batch without a checked round trip or artificial
+    /// key-release delay for every event. Focus provenance is still validated
+    /// once for the complete batch. Asynchronous X errors are handled by the
+    /// shell's ordinary X event loop.
+    pub fn inject_repeats<C: Connection>(
+        &self,
+        conn: &C,
+        input: KeyboardInput,
+        primary_app: Window,
+        count: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mapping = self.mapping.as_ref().ok_or("XTEST is unavailable")?;
+        let focus = conn.get_input_focus()?.reply()?.focus;
+        if !self.focus_belongs_to_app(conn, focus, primary_app)? {
+            return Err("X focus does not belong to the active app".into());
+        }
+        let keysym = match input {
+            KeyboardInput::Character(character) if character.is_ascii() => character as Keysym,
+            KeyboardInput::Character(_) => {
+                return Err("non-ASCII keyboard input is unsupported".into());
+            }
+            KeyboardInput::Backspace => XK_BACK_SPACE,
+            KeyboardInput::Enter => XK_RETURN,
+        };
+        let resolved = mapping
+            .resolve(keysym)
+            .ok_or("keysym is absent from the X server keyboard mapping")?;
+
+        let mut modifiers = [None, None];
+        if resolved.level3 {
+            modifiers[0] = mapping.level3_keycode;
+        }
+        if resolved.shift {
+            modifiers[1] = mapping.shift_keycode;
+        }
+        if (resolved.level3 && modifiers[0].is_none()) || (resolved.shift && modifiers[1].is_none())
+        {
+            return Err("required modifier is absent from the X server mapping".into());
+        }
+        let modifiers: Vec<Keycode> = modifiers.into_iter().flatten().collect();
+        for _ in 0..count {
+            for keycode in modifiers.iter().copied() {
+                self.fake_key_unchecked(conn, KEY_PRESS_EVENT, keycode)?;
+            }
+            self.fake_key_unchecked(conn, KEY_PRESS_EVENT, resolved.keycode)?;
+            self.fake_key_unchecked(conn, KEY_RELEASE_EVENT, resolved.keycode)?;
+            for keycode in modifiers.iter().copied().rev() {
+                self.fake_key_unchecked(conn, KEY_RELEASE_EVENT, keycode)?;
+            }
+        }
+        conn.flush()?;
+        Ok(())
+    }
+
     fn focus_belongs_to_app<C: Connection>(
         &self,
         conn: &C,
@@ -1044,6 +1145,16 @@ impl XtestInjector {
         };
         conn.xtest_fake_input(event_type, keycode, delay, self.root, 0, 0, 0)?
             .check()?;
+        Ok(())
+    }
+
+    fn fake_key_unchecked<C: Connection>(
+        &self,
+        conn: &C,
+        event_type: u8,
+        keycode: Keycode,
+    ) -> Result<(), Box<dyn Error>> {
+        let _ = conn.xtest_fake_input(event_type, keycode, CURRENT_TIME, self.root, 0, 0, 0)?;
         Ok(())
     }
 }
@@ -1242,6 +1353,45 @@ mod tests {
         assert_eq!(state.layout(), KeyboardLayout::NumberPad);
         state.activate(KeyAction::SwitchLayout(KeyboardLayout::Letters));
         assert_eq!(state.layout(), KeyboardLayout::NumberPad);
+    }
+
+    #[test]
+    fn pressed_key_state_is_private_and_requests_a_repaint() {
+        let mut state = visible(KeyboardPurpose::Password);
+        state.clear_redraw();
+        state.press_key_index(4);
+        state.press_key_index(5);
+        assert!(state.is_key_pressed(4));
+        assert!(state.is_key_pressed(5));
+        assert!(state.needs_redraw());
+
+        state.clear_redraw();
+        state.release_key_index(4);
+        assert!(!state.is_key_pressed(4));
+        assert!(state.is_key_pressed(5));
+        state.release_key_index(5);
+        assert!(!state.is_key_pressed(5));
+        assert!(state.needs_redraw());
+        let public = serde_json::to_value(state.public()).unwrap();
+        assert!(public.get("pressed_key_index").is_none());
+    }
+
+    #[test]
+    fn only_text_producing_keys_repeat() {
+        for action in [
+            KeyAction::Character('a'),
+            KeyAction::Space,
+            KeyAction::Backspace,
+        ] {
+            assert!(action.is_repeatable());
+        }
+        for action in [
+            KeyAction::Shift,
+            KeyAction::SwitchLayout(KeyboardLayout::Numbers),
+            KeyAction::Enter,
+        ] {
+            assert!(!action.is_repeatable());
+        }
     }
 
     #[test]

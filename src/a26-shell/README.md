@@ -90,6 +90,25 @@ width reference. Apple does not publish fixed system-keyboard rectangles;
 measurements and source references are recorded in
 `notes/a26-shell/APPLE-KEYBOARD-LAYOUT.md`.
 
+A touch-down immediately highlights and emits a character-producing key. Holding
+Character, Space, or Delete repeats after 200 ms at 45 events per second, matching
+the development workstation's `xset r rate 200 45` configuration. Sliding off
+the original key clears its highlight and cancels further repeats. Shift,
+layout-switch, and submit keys never repeat. The delay and rate live in the Moon
+config as `keyboard_repeat_delay_ms` and `keyboard_repeat_rate_hz`. Repeats use
+bounded, nonblocking XTEST batches so they cannot starve the shell's touch/IPC
+loop. A ten-second stale-contact watchdog clears both XI2 and pointer ownership
+if a device release event is lost.
+
+The raw XI2 keyboard path tracks every touch ID independently. Holding one key
+therefore does not serialize or suppress a second finger: the next key emits on
+its own touch-down, highlights independently, repeats on its own schedule, and
+can end while the first remains held. This is multi-touch key rollover; app and
+global-close gestures intentionally remain single-finger. Apple documents
+stable per-contact touch identities and simultaneous touch delivery, but does
+not publish private system-keyboard rollover, grace-period, or hysteresis
+timings, so Moon adds no arbitrary inter-key delay.
+
 Managed apps request keyboard state with one command on the existing control
 socket, read the JSON response, and close the connection:
 

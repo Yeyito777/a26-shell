@@ -32,6 +32,10 @@ pub struct PointerGesture {
     pub started: Instant,
     pub keyboard_owned: bool,
     pub keyboard_key_index: Option<usize>,
+    pub keyboard_pressed: bool,
+    pub keyboard_initial_sent: bool,
+    pub keyboard_repeat_uppercase: bool,
+    pub keyboard_next_repeat_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -422,6 +426,8 @@ mod tests {
             pin_length: 6,
             start_locked: true,
             initial_volume: 50,
+            keyboard_repeat_delay_ms: 200,
+            keyboard_repeat_rate_hz: 45,
             socket_path: "/tmp/a26-shell-test.sock".into(),
         }
     }

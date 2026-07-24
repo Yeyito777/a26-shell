@@ -72,3 +72,17 @@ Number-purpose fields receive a dedicated 3-by-4 number pad.
 ## Deliberate limits
 
 This change targets physical layout and muscle memory. Predictive suggestions, QuickPath, long-press alternates, space-bar trackpad mode, emoji/language switching, dictation, haptics, and locale-specific layers are separate features. Moon retains one-shot Shift, password non-retention, XTEST focus provenance checks, and the global bottom-edge app-close gesture.
+
+Moon highlights a key for the complete physical touch and repeats Character,
+Space, and Delete after a 200 ms delay at 45 events per second. These values
+match the development workstation's `xset r rate 200 45` settings. Repetition
+stops immediately when the touch leaves the original key or ends; Shift,
+layout-switch, and submit controls remain single-shot. A ten-second lost-release
+watchdog prevents a stale touchscreen contact from locking later input.
+
+Keyboard contacts use independent XI2 touch IDs, providing multi-touch key
+rollover: a second key is accepted immediately while another remains held, and
+both highlights/repeat schedules remain independent. Apple publicly documents
+simultaneous `UITouch` lifecycles but not the system keyboard's internal rollover
+limit, grace timing, or target hysteresis, so Moon does not claim unpublished
+numeric compatibility in this area.

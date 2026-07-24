@@ -42,17 +42,38 @@ const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
 const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
+const MAX_REPEAT_CATCH_UP: usize = 8;
+const STALE_POINTER_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct KeyRepeatTiming {
+    delay: Duration,
+    interval: Duration,
+}
+
+impl KeyRepeatTiming {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            delay: Duration::from_millis(config.keyboard_repeat_delay_ms),
+            interval: Duration::from_nanos(
+                1_000_000_000_u64 / u64::from(config.keyboard_repeat_rate_hz),
+            ),
+        }
+    }
+}
 
 #[derive(Default)]
 struct RawTouchTracker {
     touch_id: Option<u32>,
     x: i16,
     y: i16,
+    keyboard_contacts: Vec<(u32, PointerGesture)>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let config_path = parse_config_path()?;
     let config = Config::load(&config_path)?;
+    let key_repeat_timing = KeyRepeatTiming::from_config(&config);
     let (conn, screen_number) = RustConnection::connect(None)?;
     let screen = &conn.setup().roots[screen_number];
     let root = screen.root;
@@ -279,7 +300,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &mut raw_touch,
                 &mut key_injector,
                 &mut volume_surface,
+                key_repeat_timing,
             )?;
+        }
+
+        cancel_stale_pointer(&mut state, &mut raw_touch, Instant::now());
+        if !state.keyboard.is_visible() {
+            raw_touch.keyboard_contacts.clear();
         }
 
         if let Some(device) = power_key.as_mut() {
@@ -331,6 +358,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut state,
                         &key_injector,
                         audio_volume.as_ref(),
+                        key_repeat_timing,
                     );
                     let public = state.public(width, height);
                     ipc::respond(stream, Ok(&public));
@@ -338,6 +366,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Err(error) => ipc::respond::<model::PublicState>(stream, Err(&error)),
             }
         }
+
+        repeat_keyboard_if_due(
+            &conn,
+            &mut state,
+            &mut raw_touch,
+            &keyboard_geometry,
+            &key_injector,
+            key_repeat_timing,
+        );
 
         reconcile_apps(&mut state, &mut system_app, &mut browser_app);
         if state.app_ready_to_reveal() {
@@ -494,44 +531,93 @@ fn handle_x_event(
     raw_touch: &mut RawTouchTracker,
     key_injector: &mut XtestInjector,
     volume_surface: &mut VolumeSurface,
+    key_repeat_timing: KeyRepeatTiming,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height) = dimensions;
     match event {
         Event::XinputRawTouchBegin(event) => {
-            if raw_touch.touch_id.is_none() || state.pointer.is_none() {
-                let x = raw_axis(&event, 0, width.saturating_sub(1));
-                let y = raw_axis(&event, 1, height.saturating_sub(1));
-                if let (Some(x), Some(y)) = (x, y) {
+            let x = raw_axis(&event, 0, width.saturating_sub(1));
+            let y = raw_axis(&event, 1, height.saturating_sub(1));
+            if let (Some(x), Some(y)) = (x, y) {
+                if keyboard_geometry.owns_touch(&state.keyboard, x, y) {
+                    if let Some(action) = begin_raw_keyboard_contact(
+                        state,
+                        raw_touch,
+                        event.detail,
+                        keyboard_geometry,
+                        x,
+                        y,
+                        key_repeat_timing,
+                    ) {
+                        handle_keyboard_action(conn, state, action, key_injector);
+                    }
+                } else if raw_touch.touch_id.is_none() && state.pointer.is_none() {
+                    // Non-keyboard app/close gestures remain deliberately
+                    // single-finger even while the keyboard supports rollover.
                     raw_touch.touch_id = Some(event.detail);
                     raw_touch.x = x;
                     raw_touch.y = y;
-                    pointer_begin(state, keyboard_geometry, x, y);
+                    if let Some(action) =
+                        pointer_begin(state, keyboard_geometry, x, y, key_repeat_timing)
+                    {
+                        handle_keyboard_action(conn, state, action, key_injector);
+                    }
                 }
             }
         }
-        Event::XinputRawTouchUpdate(event) if raw_touch.touch_id == Some(event.detail) => {
-            if let Some(x) = raw_axis(&event, 0, width.saturating_sub(1)) {
-                raw_touch.x = x;
+        Event::XinputRawTouchUpdate(event) => {
+            if raw_touch
+                .keyboard_contacts
+                .iter()
+                .any(|(touch_id, _)| *touch_id == event.detail)
+            {
+                update_raw_keyboard_contact(
+                    state,
+                    raw_touch,
+                    event.detail,
+                    keyboard_geometry,
+                    raw_axis(&event, 0, width.saturating_sub(1)),
+                    raw_axis(&event, 1, height.saturating_sub(1)),
+                );
+            } else if raw_touch.touch_id == Some(event.detail) {
+                if let Some(x) = raw_axis(&event, 0, width.saturating_sub(1)) {
+                    raw_touch.x = x;
+                }
+                if let Some(y) = raw_axis(&event, 1, height.saturating_sub(1)) {
+                    raw_touch.y = y;
+                }
+                pointer_move(state, keyboard_geometry, raw_touch.x, raw_touch.y);
             }
-            if let Some(y) = raw_axis(&event, 1, height.saturating_sub(1)) {
-                raw_touch.y = y;
-            }
-            pointer_move(state, raw_touch.x, raw_touch.y);
         }
-        Event::XinputRawTouchEnd(event) if raw_touch.touch_id == Some(event.detail) => {
-            pointer_end(
-                conn,
-                root,
-                state,
-                raw_touch.x,
-                raw_touch.y,
-                width,
-                height,
-                keyboard_geometry,
-                config,
-                key_injector,
-            );
-            raw_touch.touch_id = None;
+        Event::XinputRawTouchEnd(event) => {
+            if raw_touch
+                .keyboard_contacts
+                .iter()
+                .any(|(touch_id, _)| *touch_id == event.detail)
+            {
+                end_raw_keyboard_contact(
+                    conn,
+                    state,
+                    raw_touch,
+                    event.detail,
+                    keyboard_geometry,
+                    key_injector,
+                );
+            } else if raw_touch.touch_id == Some(event.detail) {
+                pointer_end(
+                    conn,
+                    root,
+                    state,
+                    raw_touch.x,
+                    raw_touch.y,
+                    width,
+                    height,
+                    keyboard_geometry,
+                    config,
+                    key_injector,
+                );
+                raw_touch.touch_id = None;
+            }
         }
         Event::Expose(event) if event.window == shell_window => state.redraw = true,
         Event::Expose(event) if event.window == keyboard_window => {
@@ -541,10 +627,20 @@ fn handle_x_event(
             volume_surface.request_redraw();
         }
         Event::ButtonPress(event) if event.event == shell_window => {
-            pointer_begin(state, keyboard_geometry, event.event_x, event.event_y);
+            if state.pointer.is_none() && raw_touch.keyboard_contacts.is_empty() {
+                if let Some(action) = pointer_begin(
+                    state,
+                    keyboard_geometry,
+                    event.event_x,
+                    event.event_y,
+                    key_repeat_timing,
+                ) {
+                    handle_keyboard_action(conn, state, action, key_injector);
+                }
+            }
         }
         Event::MotionNotify(event) if event.event == shell_window => {
-            pointer_move(state, event.event_x, event.event_y);
+            pointer_move(state, keyboard_geometry, event.event_x, event.event_y);
         }
         Event::ButtonRelease(event) if event.event == shell_window => {
             pointer_end(
@@ -800,29 +896,329 @@ fn stop_system_app(child: &mut Option<Child>) {
     }
 }
 
-fn pointer_begin(state: &mut ShellState, keyboard_geometry: &KeyboardGeometry, x: i16, y: i16) {
+fn pointer_begin(
+    state: &mut ShellState,
+    keyboard_geometry: &KeyboardGeometry,
+    x: i16,
+    y: i16,
+    repeat_timing: KeyRepeatTiming,
+) -> Option<keyboard::KeyAction> {
     if !state.screen_awake {
-        return;
+        return None;
     }
-    let keyboard_owned = keyboard_geometry.owns_touch(&state.keyboard, x, y);
-    let keyboard_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
-    state.pointer = Some(PointerGesture {
-        start_x: x,
-        start_y: y,
-        last_x: x,
-        last_y: y,
-        started: Instant::now(),
-        keyboard_owned,
-        keyboard_key_index,
-    });
+    if let Some(previous) = state.pointer.take()
+        && previous.keyboard_pressed
+        && let Some(index) = previous.keyboard_key_index
+    {
+        state.keyboard.release_key_index(index);
+    }
+    let (pointer, action) = new_pointer_gesture(state, keyboard_geometry, x, y, repeat_timing);
+    if pointer.keyboard_pressed
+        && let Some(index) = pointer.keyboard_key_index
+    {
+        state.keyboard.press_key_index(index);
+    }
+    state.pointer = Some(pointer);
     state.last_action = "pointer_begin".into();
+    action
 }
 
-fn pointer_move(state: &mut ShellState, x: i16, y: i16) {
+fn new_pointer_gesture(
+    state: &ShellState,
+    keyboard_geometry: &KeyboardGeometry,
+    x: i16,
+    y: i16,
+    repeat_timing: KeyRepeatTiming,
+) -> (PointerGesture, Option<keyboard::KeyAction>) {
+    let keyboard_owned = keyboard_geometry.owns_touch(&state.keyboard, x, y);
+    let keyboard_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
+    let repeatable_action = keyboard_key_index
+        .and_then(|index| keyboard_geometry.keys(&state.keyboard).get(index).cloned())
+        .map(|key| key.action)
+        .filter(|action| action.is_repeatable());
+    let started = Instant::now();
+    (
+        PointerGesture {
+            start_x: x,
+            start_y: y,
+            last_x: x,
+            last_y: y,
+            started,
+            keyboard_owned,
+            keyboard_key_index,
+            keyboard_pressed: keyboard_owned && keyboard_key_index.is_some(),
+            keyboard_initial_sent: repeatable_action.is_some(),
+            keyboard_repeat_uppercase: state.keyboard.shift(),
+            keyboard_next_repeat_at: repeatable_action.map(|_| started + repeat_timing.delay),
+        },
+        repeatable_action,
+    )
+}
+
+fn pointer_move(state: &mut ShellState, keyboard_geometry: &KeyboardGeometry, x: i16, y: i16) {
+    let current_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
+    let pressed_key_index = state.pointer.as_ref().and_then(|pointer| {
+        (pointer.keyboard_owned && pointer.keyboard_key_index == current_key_index)
+            .then_some(pointer.keyboard_key_index)
+            .flatten()
+    });
     if let Some(pointer) = state.pointer.as_mut() {
+        let was_pressed = pointer.keyboard_pressed;
         pointer.last_x = x;
         pointer.last_y = y;
+        pointer.keyboard_pressed = pressed_key_index.is_some();
+        if pressed_key_index.is_none() {
+            pointer.keyboard_next_repeat_at = None;
+        }
+        if was_pressed != pointer.keyboard_pressed
+            && let Some(index) = pointer.keyboard_key_index
+        {
+            if pointer.keyboard_pressed {
+                state.keyboard.press_key_index(index);
+            } else {
+                state.keyboard.release_key_index(index);
+            }
+        }
     }
+}
+
+fn begin_raw_keyboard_contact(
+    state: &mut ShellState,
+    raw_touch: &mut RawTouchTracker,
+    touch_id: u32,
+    keyboard_geometry: &KeyboardGeometry,
+    x: i16,
+    y: i16,
+    repeat_timing: KeyRepeatTiming,
+) -> Option<keyboard::KeyAction> {
+    if raw_touch
+        .keyboard_contacts
+        .iter()
+        .any(|(existing, _)| *existing == touch_id)
+    {
+        return None;
+    }
+    let (pointer, action) = new_pointer_gesture(state, keyboard_geometry, x, y, repeat_timing);
+    if !pointer.keyboard_owned {
+        return None;
+    }
+    if pointer.keyboard_pressed
+        && let Some(index) = pointer.keyboard_key_index
+    {
+        state.keyboard.press_key_index(index);
+    }
+    raw_touch.keyboard_contacts.push((touch_id, pointer));
+    state.last_action = "keyboard_contact_begin".into();
+    action
+}
+
+fn update_raw_keyboard_contact(
+    state: &mut ShellState,
+    raw_touch: &mut RawTouchTracker,
+    touch_id: u32,
+    keyboard_geometry: &KeyboardGeometry,
+    x: Option<i16>,
+    y: Option<i16>,
+) {
+    let Some(position) = raw_touch
+        .keyboard_contacts
+        .iter()
+        .position(|(existing, _)| *existing == touch_id)
+    else {
+        return;
+    };
+    let (next_x, next_y) = {
+        let pointer = &raw_touch.keyboard_contacts[position].1;
+        (x.unwrap_or(pointer.last_x), y.unwrap_or(pointer.last_y))
+    };
+    let current_key_index = keyboard_geometry.key_index_at(&state.keyboard, next_x, next_y);
+    let pointer = &mut raw_touch.keyboard_contacts[position].1;
+    let should_press = pointer.keyboard_key_index == current_key_index;
+    let was_pressed = pointer.keyboard_pressed;
+    pointer.last_x = next_x;
+    pointer.last_y = next_y;
+    pointer.keyboard_pressed = should_press;
+    if !should_press {
+        pointer.keyboard_next_repeat_at = None;
+    }
+    if was_pressed != should_press
+        && let Some(index) = pointer.keyboard_key_index
+    {
+        if should_press {
+            state.keyboard.press_key_index(index);
+        } else {
+            state.keyboard.release_key_index(index);
+        }
+    }
+}
+
+fn end_raw_keyboard_contact(
+    conn: &RustConnection,
+    state: &mut ShellState,
+    raw_touch: &mut RawTouchTracker,
+    touch_id: u32,
+    keyboard_geometry: &KeyboardGeometry,
+    key_injector: &XtestInjector,
+) {
+    let Some(position) = raw_touch
+        .keyboard_contacts
+        .iter()
+        .position(|(existing, _)| *existing == touch_id)
+    else {
+        return;
+    };
+    let (_, pointer) = raw_touch.keyboard_contacts.remove(position);
+    if pointer.keyboard_pressed
+        && let Some(index) = pointer.keyboard_key_index
+    {
+        state.keyboard.release_key_index(index);
+    }
+    let previous_layout = state.keyboard.layout();
+    finish_keyboard_pointer(conn, state, pointer, keyboard_geometry, key_injector);
+    if !state.keyboard.is_visible() || state.keyboard.layout() != previous_layout {
+        for (_, contact) in raw_touch.keyboard_contacts.drain(..) {
+            if contact.keyboard_pressed
+                && let Some(index) = contact.keyboard_key_index
+            {
+                state.keyboard.release_key_index(index);
+            }
+        }
+    }
+}
+
+fn repeat_keyboard_if_due(
+    conn: &RustConnection,
+    state: &mut ShellState,
+    raw_touch: &mut RawTouchTracker,
+    keyboard_geometry: &KeyboardGeometry,
+    key_injector: &XtestInjector,
+    repeat_timing: KeyRepeatTiming,
+) {
+    if !state.keyboard.is_visible() {
+        return;
+    }
+    let now = Instant::now();
+    let mut repeats = Vec::with_capacity(raw_touch.keyboard_contacts.len() + 1);
+    if let Some(pointer) = state.pointer.as_mut()
+        && let Some(repeat) = due_repeat(pointer, now, repeat_timing.interval)
+    {
+        repeats.push(repeat);
+    }
+    for (_, pointer) in &mut raw_touch.keyboard_contacts {
+        if let Some(repeat) = due_repeat(pointer, now, repeat_timing.interval) {
+            repeats.push(repeat);
+        }
+    }
+    for (index, repeat_count, uppercase) in repeats {
+        let Some(action) = keyboard_geometry
+            .keys(&state.keyboard)
+            .get(index)
+            .map(|key| key.action)
+            .filter(|action| action.is_repeatable())
+        else {
+            continue;
+        };
+        let input = match action {
+            keyboard::KeyAction::Character(mut character) => {
+                if uppercase && character.is_ascii_alphabetic() {
+                    character.make_ascii_uppercase();
+                }
+                keyboard::KeyboardInput::Character(character)
+            }
+            keyboard::KeyAction::Space => keyboard::KeyboardInput::Character(' '),
+            keyboard::KeyAction::Backspace => keyboard::KeyboardInput::Backspace,
+            keyboard::KeyAction::Shift
+            | keyboard::KeyAction::SwitchLayout(_)
+            | keyboard::KeyAction::Enter => continue,
+        };
+        let result = state
+            .managed_windows
+            .first()
+            .copied()
+            .ok_or_else(|| "active app window is unavailable".into())
+            .and_then(|primary| key_injector.inject_repeats(conn, input, primary, repeat_count));
+        if let Err(error) = result {
+            // Never include repeated character/key identity in diagnostics.
+            eprintln!("keyboard repeat injection failed: {error}");
+            state.hide_keyboard();
+            state.pointer = None;
+            raw_touch.keyboard_contacts.clear();
+            raw_touch.touch_id = None;
+            state.last_action = "keyboard_input_failed".into();
+            return;
+        }
+        state.last_action = "keyboard_repeat".into();
+    }
+}
+
+fn due_repeat(
+    pointer: &mut PointerGesture,
+    now: Instant,
+    interval: Duration,
+) -> Option<(usize, usize, bool)> {
+    let index = pointer.keyboard_key_index?;
+    if !pointer.keyboard_owned || !pointer.keyboard_pressed {
+        return None;
+    }
+    let count = take_due_repeats(&mut pointer.keyboard_next_repeat_at, now, interval);
+    (count > 0).then_some((index, count, pointer.keyboard_repeat_uppercase))
+}
+
+fn cancel_stale_pointer(state: &mut ShellState, raw_touch: &mut RawTouchTracker, now: Instant) {
+    let legacy_stale = state
+        .pointer
+        .as_ref()
+        .is_some_and(|pointer| now.duration_since(pointer.started) >= STALE_POINTER_TIMEOUT);
+    let mut recovered = false;
+    if legacy_stale {
+        if let Some(pointer) = state.pointer.take()
+            && pointer.keyboard_pressed
+            && let Some(index) = pointer.keyboard_key_index
+        {
+            state.keyboard.release_key_index(index);
+        }
+        raw_touch.touch_id = None;
+        recovered = true;
+    }
+    let mut position = 0;
+    while position < raw_touch.keyboard_contacts.len() {
+        if now.duration_since(raw_touch.keyboard_contacts[position].1.started)
+            >= STALE_POINTER_TIMEOUT
+        {
+            let (_, pointer) = raw_touch.keyboard_contacts.remove(position);
+            if pointer.keyboard_pressed
+                && let Some(index) = pointer.keyboard_key_index
+            {
+                state.keyboard.release_key_index(index);
+            }
+            recovered = true;
+        } else {
+            position += 1;
+        }
+    }
+    if recovered {
+        state.last_action = "pointer_timeout_recovered".into();
+    }
+}
+
+fn take_due_repeats(
+    next_repeat_at: &mut Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> usize {
+    let Some(mut deadline) = *next_repeat_at else {
+        return 0;
+    };
+    let mut count = 0;
+    while now >= deadline && count < MAX_REPEAT_CATCH_UP {
+        count += 1;
+        deadline += interval;
+    }
+    if count == MAX_REPEAT_CATCH_UP && now >= deadline {
+        deadline = now + interval;
+    }
+    *next_repeat_at = Some(deadline);
+    count
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -843,28 +1239,18 @@ fn pointer_end(
     };
     pointer.last_x = x;
     pointer.last_y = y;
+    if pointer.keyboard_owned {
+        if pointer.keyboard_pressed
+            && let Some(index) = pointer.keyboard_key_index
+        {
+            state.keyboard.release_key_index(index);
+        }
+        finish_keyboard_pointer(conn, state, pointer, keyboard_geometry, key_injector);
+        return;
+    }
     let dx = i32::from(pointer.last_x) - i32::from(pointer.start_x);
     let dy = i32::from(pointer.last_y) - i32::from(pointer.start_y);
     let elapsed = pointer.started.elapsed();
-    if pointer.keyboard_owned {
-        let end_key_index = keyboard_geometry.key_index_at(&state.keyboard, x, y);
-        if dx.abs() <= 60
-            && dy.abs() <= 60
-            && elapsed <= Duration::from_millis(850)
-            && pointer.keyboard_key_index == end_key_index
-        {
-            if let Some(index) = pointer.keyboard_key_index {
-                if let Some(key) = keyboard_geometry.keys(&state.keyboard).get(index) {
-                    handle_keyboard_action(conn, state, key.action, key_injector);
-                }
-            } else {
-                state.last_action = "keyboard_tap_between_keys".into();
-            }
-        } else {
-            state.last_action = "keyboard_gesture_cancel".into();
-        }
-        return;
-    }
     let upward = -dy;
     let bottom_start = i32::from(pointer.start_y) >= i32::from(height) - 180;
     let close_swipe = state.view.is_app()
@@ -894,6 +1280,37 @@ fn pointer_end(
         state.last_action = "gesture_cancel".into();
     }
     state.redraw = true;
+}
+
+fn finish_keyboard_pointer(
+    conn: &RustConnection,
+    state: &mut ShellState,
+    pointer: PointerGesture,
+    keyboard_geometry: &KeyboardGeometry,
+    key_injector: &XtestInjector,
+) {
+    let dx = i32::from(pointer.last_x) - i32::from(pointer.start_x);
+    let dy = i32::from(pointer.last_y) - i32::from(pointer.start_y);
+    let elapsed = pointer.started.elapsed();
+    let end_key_index =
+        keyboard_geometry.key_index_at(&state.keyboard, pointer.last_x, pointer.last_y);
+    if dx.abs() <= 60
+        && dy.abs() <= 60
+        && (pointer.keyboard_initial_sent || elapsed <= Duration::from_millis(850))
+        && pointer.keyboard_key_index == end_key_index
+    {
+        if let Some(index) = pointer.keyboard_key_index {
+            if !pointer.keyboard_initial_sent
+                && let Some(key) = keyboard_geometry.keys(&state.keyboard).get(index)
+            {
+                handle_keyboard_action(conn, state, key.action, key_injector);
+            }
+        } else {
+            state.last_action = "keyboard_tap_between_keys".into();
+        }
+    } else {
+        state.last_action = "keyboard_gesture_cancel".into();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -965,21 +1382,33 @@ fn handle_keyboard_action(
 ) {
     match state.activate_keyboard_key(action) {
         KeyboardEffect::Inject(input) => {
-            let result = state
-                .managed_windows
-                .first()
-                .copied()
-                .ok_or_else(|| "active app window is unavailable".into())
-                .and_then(|primary| key_injector.inject(conn, input, primary));
-            if let Err(error) = result {
-                // Never include the character or key action in this diagnostic;
-                // password input is intentionally ephemeral and non-loggable.
-                eprintln!("keyboard input injection failed: {error}");
-                state.hide_keyboard();
-                state.last_action = "keyboard_input_failed".into();
-            }
+            inject_keyboard_input(conn, state, input, key_injector, None);
         }
         KeyboardEffect::None => {}
+    }
+}
+
+fn inject_keyboard_input(
+    conn: &RustConnection,
+    state: &mut ShellState,
+    input: keyboard::KeyboardInput,
+    key_injector: &XtestInjector,
+    success_action: Option<&'static str>,
+) {
+    let result = state
+        .managed_windows
+        .first()
+        .copied()
+        .ok_or_else(|| "active app window is unavailable".into())
+        .and_then(|primary| key_injector.inject(conn, input, primary));
+    if let Err(error) = result {
+        // Never include the character or key action in this diagnostic;
+        // password input is intentionally ephemeral and non-loggable.
+        eprintln!("keyboard input injection failed: {error}");
+        state.hide_keyboard();
+        state.last_action = "keyboard_input_failed".into();
+    } else if let Some(action) = success_action {
+        state.last_action = action.into();
     }
 }
 
@@ -995,6 +1424,7 @@ fn apply_command(
     state: &mut ShellState,
     key_injector: &XtestInjector,
     audio_volume: Option<&AudioVolume>,
+    key_repeat_timing: KeyRepeatTiming,
 ) {
     match command {
         Command::Ping | Command::State => {}
@@ -1014,8 +1444,12 @@ fn apply_command(
             config,
             key_injector,
         ),
-        Command::PointerBegin(x, y) => pointer_begin(state, keyboard_geometry, x, y),
-        Command::PointerMove(x, y) => pointer_move(state, x, y),
+        Command::PointerBegin(x, y) => {
+            if let Some(action) = pointer_begin(state, keyboard_geometry, x, y, key_repeat_timing) {
+                handle_keyboard_action(conn, state, action, key_injector);
+            }
+        }
+        Command::PointerMove(x, y) => pointer_move(state, keyboard_geometry, x, y),
         Command::PointerEnd(x, y) => pointer_end(
             conn,
             root,
@@ -1118,5 +1552,138 @@ mod touch_tests {
         };
         assert_eq!(raw_axis(&event, 0, 1079), None);
         assert_eq!(raw_axis(&event, 1, 2339), Some(1700));
+    }
+
+    #[test]
+    fn keyboard_repeat_matches_workstation_xrate() {
+        let config = KeyRepeatTiming {
+            delay: Duration::from_millis(200),
+            interval: Duration::from_nanos(1_000_000_000 / 45),
+        };
+        assert_eq!(config.delay, Duration::from_millis(200));
+        assert_eq!(config.interval, Duration::from_nanos(22_222_222));
+
+        let base = Instant::now();
+        let mut next = Some(base + config.delay);
+        assert_eq!(
+            take_due_repeats(
+                &mut next,
+                base + Duration::from_millis(199),
+                config.interval,
+            ),
+            0
+        );
+        assert_eq!(
+            take_due_repeats(
+                &mut next,
+                base + Duration::from_millis(200),
+                config.interval,
+            ),
+            1
+        );
+        assert_eq!(
+            take_due_repeats(
+                &mut next,
+                base + Duration::from_millis(245),
+                config.interval,
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn keyboard_contacts_have_independent_multitouch_rollover() {
+        let geometry = KeyboardGeometry::new(1080, 2340);
+        let repeat = KeyRepeatTiming {
+            delay: Duration::from_millis(200),
+            interval: Duration::from_nanos(1_000_000_000 / 45),
+        };
+        let mut state = ShellState::new(false, 50);
+        state.keyboard.show(keyboard::KeyboardPurpose::Text);
+        let mut raw_touch = RawTouchTracker::default();
+
+        let first = begin_raw_keyboard_contact(
+            &mut state,
+            &mut raw_touch,
+            11,
+            &geometry,
+            754,
+            1752,
+            repeat,
+        );
+        let second = begin_raw_keyboard_contact(
+            &mut state,
+            &mut raw_touch,
+            12,
+            &geometry,
+            647,
+            1752,
+            repeat,
+        );
+
+        assert_eq!(first, Some(keyboard::KeyAction::Character('j')));
+        assert_eq!(second, Some(keyboard::KeyAction::Character('h')));
+        assert_eq!(raw_touch.keyboard_contacts.len(), 2);
+        let first_index = raw_touch.keyboard_contacts[0].1.keyboard_key_index.unwrap();
+        let second_index = raw_touch.keyboard_contacts[1].1.keyboard_key_index.unwrap();
+        assert!(state.keyboard.is_key_pressed(first_index));
+        assert!(state.keyboard.is_key_pressed(second_index));
+
+        update_raw_keyboard_contact(
+            &mut state,
+            &mut raw_touch,
+            11,
+            &geometry,
+            Some(10),
+            Some(1752),
+        );
+        assert!(!state.keyboard.is_key_pressed(first_index));
+        assert!(state.keyboard.is_key_pressed(second_index));
+        assert!(
+            raw_touch.keyboard_contacts[0]
+                .1
+                .keyboard_next_repeat_at
+                .is_none()
+        );
+        assert!(
+            raw_touch.keyboard_contacts[1]
+                .1
+                .keyboard_next_repeat_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_touch_watchdog_releases_keyboard_and_raw_contact() {
+        let now = Instant::now();
+        let mut state = ShellState::new(false, 50);
+        state.keyboard.show(keyboard::KeyboardPurpose::Text);
+        state.keyboard.press_key_index(0);
+        state.pointer = Some(PointerGesture {
+            start_x: 64,
+            start_y: 1604,
+            last_x: 64,
+            last_y: 1604,
+            started: now - STALE_POINTER_TIMEOUT - Duration::from_millis(1),
+            keyboard_owned: true,
+            keyboard_key_index: Some(0),
+            keyboard_pressed: true,
+            keyboard_initial_sent: true,
+            keyboard_repeat_uppercase: false,
+            keyboard_next_repeat_at: Some(now),
+        });
+        let mut raw_touch = RawTouchTracker {
+            touch_id: Some(7),
+            x: 64,
+            y: 1604,
+            keyboard_contacts: Vec::new(),
+        };
+
+        cancel_stale_pointer(&mut state, &mut raw_touch, now);
+
+        assert!(state.pointer.is_none());
+        assert!(raw_touch.touch_id.is_none());
+        assert!(!state.keyboard.is_key_pressed(0));
+        assert_eq!(state.last_action, "pointer_timeout_recovered");
     }
 }
