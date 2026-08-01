@@ -68,6 +68,12 @@ so Chromium helpers cannot survive unsupervised. Foreground and leased apps are
 never candidates. The root-only `memory-pressure simulate` control runs the same
 single-victim policy for deterministic device testing without allocating memory.
 
+Moon's event loop blocks in `poll(2)` over X11, its root-only control socket,
+power/volume input devices, and app pidfds. Timer wakeups are scheduled only for
+keyboard repeat, gesture recovery, launch animation, status/heartbeat checks,
+lease expiry, and UI deadlines. If an older kernel cannot create a pidfd, only
+that process uses a bounded 250 ms status fallback. There is no idle 8 ms spin.
+
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
 design. IPC access is restricted to the root-owned chroot runtime.

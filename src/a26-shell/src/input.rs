@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read};
 use std::mem::size_of;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -74,6 +75,10 @@ impl VolumeKeys {
         self.pending.drain(..complete);
         Ok(keys)
     }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
 }
 
 /// Non-grabbing reader for the PMIC power key. Android does not expose this
@@ -134,6 +139,10 @@ impl PowerKey {
         }
         self.pending.drain(..complete);
         Ok(presses)
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 }
 

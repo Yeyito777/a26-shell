@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -85,6 +86,10 @@ impl IpcServer {
             }
         }
         requests
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
     }
 }
 

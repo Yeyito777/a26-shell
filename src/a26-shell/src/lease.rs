@@ -107,6 +107,16 @@ impl LeaseManager {
             })
             .collect()
     }
+
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        self.deadlines
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .filter(|deadline| *deadline > now)
+            .min()
+    }
 }
 
 #[cfg(test)]

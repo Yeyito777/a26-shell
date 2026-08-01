@@ -65,6 +65,15 @@ if violations:
     )
 print("runtime X11 round-trip guard: PASS")
 PY
+if grep -Fq 'thread::sleep' "$SOURCE/src/main.rs"; then
+    echo 'event-loop regression: runtime thread::sleep reintroduced' >&2
+    exit 31
+fi
+grep -Fq 'libc::poll(' "$SOURCE/src/main.rs" || {
+    echo 'event-loop regression: blocking poll is missing' >&2
+    exit 32
+}
+echo 'blocking event-loop guard: PASS'
 sh -n "$PROJECT_ROOT/scripts/device/moon-boot-supervisor.sh"
 
 mkdir -p "$IMAGE/bin" "$IMAGE/source"

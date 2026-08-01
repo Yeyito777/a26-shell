@@ -509,6 +509,19 @@ impl ShellState {
             self.redraw = true;
         }
     }
+
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        [
+            self.lockout_until,
+            self.volume_overlay_until,
+            self.app_window_mapped_at
+                .and_then(|mapped| mapped.checked_add(Duration::from_millis(1500))),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|deadline| *deadline > now)
+        .min()
+    }
 }
 
 impl Drop for ShellState {

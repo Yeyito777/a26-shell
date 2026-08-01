@@ -60,6 +60,9 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 [[ "$external_ready" == 1 ]]
+shell_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-shell"' | tr -d '\r')"
+pidfd_count="$(adb -s "$SERIAL" shell "/data/local/tmp/su -c 'ls -l /proc/$shell_pid/fd | grep -c \"anon_inode:\[pidfd\]\" || true'" | tr -d '\r')"
+[[ "$pidfd_count" -ge 1 ]]
 
 # The process enters its freezer group before exec, so every child it creates
 # inherits the same group without a post-spawn race.

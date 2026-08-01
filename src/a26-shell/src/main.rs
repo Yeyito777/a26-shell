@@ -16,9 +16,10 @@ mod volume;
 
 use std::env;
 use std::error::Error;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use apps::{AppRegistry, RegistryUpdate, WindowVisibility};
@@ -49,6 +50,7 @@ const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const MEDIA_ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
 const MEDIA_ACTIVITY_MAX_AGE: Duration = Duration::from_secs(2);
 const MEMORY_STATUS_INTERVAL: Duration = Duration::from_secs(5);
+const FALLBACK_PROCESS_STATUS_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const MAX_REPEAT_CATCH_UP: usize = 8;
 const STALE_POINTER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -413,7 +415,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
 
         let now = Instant::now();
-        if now >= next_media_activity {
+        if apps.browser_running() && now >= next_media_activity {
             if heartbeat_is_recent(
                 Path::new("/run/moon-audio/browser-media-active"),
                 MEDIA_ACTIVITY_MAX_AGE,
@@ -421,6 +423,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 apps.renew_browser_media_activity(now);
             }
             next_media_activity = now + MEDIA_ACTIVITY_INTERVAL;
+        } else if !apps.browser_running() {
+            // Make the first check immediate after the Browser starts, without
+            // polling a nonexistent heartbeat while Moon is idle.
+            next_media_activity = now;
         }
         if now >= next_memory_status {
             match memory::MemorySnapshot::read() {
@@ -572,7 +578,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         // traffic in this state, so they cannot rely on a shell repaint to
         // flush the connection.
         conn.flush()?;
-        thread::sleep(Duration::from_millis(8));
+        let now = Instant::now();
+        let mut deadline = next_device_status.min(next_memory_status);
+        if apps.browser_running() {
+            deadline = deadline.min(next_media_activity);
+        }
+        if state.app_launching() {
+            deadline = deadline.min(next_launch_animation);
+        }
+        if let Some(state_deadline) = state.next_deadline(now) {
+            deadline = deadline.min(state_deadline);
+        }
+        if let Some(lease_deadline) = apps.next_lease_deadline(now) {
+            deadline = deadline.min(lease_deadline);
+        }
+        if let Some(input_deadline) = next_input_deadline(&state, &raw_touch) {
+            deadline = deadline.min(input_deadline);
+        }
+        if apps.needs_process_poll() {
+            deadline = deadline.min(now + FALLBACK_PROCESS_STATUS_INTERVAL);
+        }
+        let app_fds = apps.poll_fds();
+        wait_for_activity(
+            &conn,
+            &ipc,
+            power_key.as_ref(),
+            volume_keys.as_ref(),
+            &app_fds,
+            deadline.saturating_duration_since(now),
+        )?;
     }
 
     // A normal development restart must never strand the device with its
@@ -628,6 +662,79 @@ fn heartbeat_is_recent(path: &Path, maximum_age: Duration) -> bool {
         // writes.
         Err(_) => true,
     }
+}
+
+fn next_input_deadline(state: &ShellState, raw_touch: &RawTouchTracker) -> Option<Instant> {
+    state
+        .pointer
+        .iter()
+        .chain(
+            raw_touch
+                .keyboard_contacts
+                .iter()
+                .map(|(_, pointer)| pointer),
+        )
+        .flat_map(|pointer| {
+            [
+                pointer.keyboard_next_repeat_at,
+                pointer.started.checked_add(STALE_POINTER_TIMEOUT),
+            ]
+        })
+        .flatten()
+        .min()
+}
+
+fn wait_for_activity(
+    conn: &RustConnection,
+    ipc: &IpcServer,
+    power_key: Option<&PowerKey>,
+    volume_keys: Option<&VolumeKeys>,
+    app_fds: &[RawFd],
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut descriptors = Vec::with_capacity(4 + app_fds.len());
+    let mut add = |fd: RawFd| {
+        descriptors.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    };
+    add(conn.stream().as_raw_fd());
+    add(ipc.raw_fd());
+    if let Some(device) = power_key {
+        add(device.raw_fd());
+    }
+    if let Some(device) = volume_keys {
+        add(device.raw_fd());
+    }
+    for fd in app_fds {
+        add(*fd);
+    }
+
+    let timeout_ms = duration_to_poll_timeout(timeout);
+    // SAFETY: descriptors points to initialized pollfd values for its full
+    // length and remains alive for the duration of poll.
+    let result = unsafe {
+        libc::poll(
+            descriptors.as_mut_ptr(),
+            descriptors.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn duration_to_poll_timeout(timeout: Duration) -> i32 {
+    let milliseconds = timeout.as_millis();
+    let rounded_up = milliseconds + u128::from(timeout.subsec_nanos() % 1_000_000 != 0);
+    rounded_up.min(i32::MAX as u128) as i32
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1742,6 +1849,14 @@ mod touch_tests {
         std::fs::write(&path, b"active\n").unwrap();
         assert!(heartbeat_is_recent(&path, Duration::from_secs(2)));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn poll_timeout_rounds_up_without_overflowing() {
+        assert_eq!(duration_to_poll_timeout(Duration::ZERO), 0);
+        assert_eq!(duration_to_poll_timeout(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_to_poll_timeout(Duration::from_millis(8)), 8);
+        assert_eq!(duration_to_poll_timeout(Duration::MAX), i32::MAX);
     }
 
     #[test]

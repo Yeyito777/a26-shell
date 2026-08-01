@@ -1,4 +1,6 @@
 use std::env;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,6 +38,7 @@ struct Application {
     id: AppId,
     executable: PathBuf,
     child: Option<Child>,
+    pidfd: Option<OwnedFd>,
     lifecycle: AppLifecycle,
     windows: Vec<ManagedWindow>,
     freezer: FreezerGroup,
@@ -48,6 +51,7 @@ impl Application {
             id,
             executable,
             child: None,
+            pidfd: None,
             lifecycle: AppLifecycle::Stopped,
             windows: Vec::new(),
             freezer: FreezerGroup::prepare(id),
@@ -94,6 +98,7 @@ impl Application {
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
+        self.pidfd = None;
         self.lifecycle = AppLifecycle::Stopped;
         self.windows.clear();
         self.freezer.note_stopped();
@@ -244,6 +249,7 @@ impl AppRegistry {
                 Some(Ok(Some(status))) => {
                     eprintln!("{} exited with {status}", application.id.display_name());
                     application.child = None;
+                    application.pidfd = None;
                     application.lifecycle = AppLifecycle::Stopped;
                     application.windows.clear();
                     application.freezer.note_stopped();
@@ -360,6 +366,17 @@ impl AppRegistry {
                             process.id()
                         );
                         application.child = Some(process);
+                        application.pidfd = match open_pidfd(application.pid().unwrap_or_default())
+                        {
+                            Ok(fd) => Some(fd),
+                            Err(error) => {
+                                eprintln!(
+                                    "{} pidfd unavailable; using bounded status polling: {error}",
+                                    application.id.display_name()
+                                );
+                                None
+                            }
+                        };
                         application.freezer.note_spawned();
                         application.lifecycle = AppLifecycle::Launching;
                         application.last_used = now;
@@ -437,6 +454,27 @@ impl AppRegistry {
         }
     }
 
+    pub fn browser_running(&self) -> bool {
+        self.app(AppId::Browser).lifecycle != AppLifecycle::Stopped
+    }
+
+    pub fn poll_fds(&self) -> Vec<RawFd> {
+        self.applications
+            .iter()
+            .filter_map(|application| application.pidfd.as_ref().map(AsRawFd::as_raw_fd))
+            .collect()
+    }
+
+    pub fn needs_process_poll(&self) -> bool {
+        self.applications
+            .iter()
+            .any(|application| application.child.is_some() && application.pidfd.is_none())
+    }
+
+    pub fn next_lease_deadline(&self, now: Instant) -> Option<Instant> {
+        self.leases.next_deadline(now)
+    }
+
     pub fn evict_lru_background(&mut self, now: Instant) -> Option<AppId> {
         self.leases.expire(now);
         let mut candidate: Option<(AppId, Instant)> = None;
@@ -461,6 +499,17 @@ impl AppRegistry {
     fn app_mut(&mut self, id: AppId) -> &mut Application {
         &mut self.applications[id.index()]
     }
+}
+
+fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open has no pointer arguments. A successful returned fd is
+    // uniquely owned here and immediately wrapped in OwnedFd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) } as i32;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh successful pidfd_open result.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[derive(Debug, Clone, Copy)]
