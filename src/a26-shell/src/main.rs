@@ -11,6 +11,7 @@ mod memory;
 mod model;
 mod status;
 mod status_bar;
+mod suspend;
 mod ui;
 mod volume;
 
@@ -30,6 +31,7 @@ use ipc::{Command, IpcServer};
 use keyboard::{KeyboardEffect, KeyboardGeometry, KeyboardSurface, XtestInjector};
 use model::{AppId, PointerGesture, ShellState, View};
 use status_bar::StatusBarSurface;
+use suspend::{SuspendAction, SuspendCoordinator};
 use ui::{KeypadAction, Renderer};
 use volume::VolumeSurface;
 use x11rb::connection::Connection;
@@ -277,7 +279,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         }
     };
-    let mut hardware_awake = true;
+    let mut suspend_coordinator = SuspendCoordinator::new(true);
     let mut raw_touch = RawTouchTracker::default();
     let mut app_viewport: Option<(u32, u16)> = None;
     let mut shell_inset = false;
@@ -398,7 +400,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         audio_volume.as_ref(),
                         key_repeat_timing,
                     );
-                    let public = state.public(width, height, apps.public());
+                    let public =
+                        state.public(width, height, apps.public(), suspend_coordinator.public());
                     ipc::respond(stream, Ok(&public));
                 }
                 Err(error) => ipc::respond::<model::PublicState>(stream, Err(&error)),
@@ -520,38 +523,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             next_launch_animation = Instant::now() + LAUNCH_ANIMATION_INTERVAL;
         }
         state.tick();
-        if state.screen_awake != hardware_awake {
-            // Draw the safe frame before changing brightness. During wake the
-            // lock screen is therefore complete before the panel lights up.
-            renderer.render(&conn, &state)?;
-            state.redraw = false;
-            if state.screen_awake {
-                if let Some(device) = touchscreen.as_ref()
-                    && let Err(error) = device.on()
-                {
-                    eprintln!("touchscreen wake failed: {error}");
-                }
-                if let Some(device) = backlight.as_mut()
-                    && let Err(error) = device.on()
-                {
-                    eprintln!("panel backlight wake failed: {error}");
-                    backlight = None;
-                }
-            } else {
-                if let Some(device) = backlight.as_mut()
-                    && let Err(error) = device.off()
-                {
-                    eprintln!("panel backlight sleep failed: {error}");
-                    backlight = None;
-                }
-                if let Some(device) = touchscreen.as_ref()
-                    && let Err(error) = device.off()
-                {
-                    eprintln!("touchscreen sleep failed: {error}");
-                }
-            }
-            hardware_awake = state.screen_awake;
-        }
         if state.redraw {
             if !state.view.is_app() || state.app_launching() {
                 raise_shell(&conn, shell_window)?;
@@ -578,6 +549,58 @@ fn main() -> Result<(), Box<dyn Error>> {
         // traffic in this state, so they cannot rely on a shell repaint to
         // flush the connection.
         conn.flush()?;
+        match suspend_coordinator.next_action(state.screen_awake) {
+            SuspendAction::None => {}
+            SuspendAction::Sleep => {
+                if !safe_to_power_down(&state, &apps) {
+                    eprintln!("screen-off transaction rejected: unsafe shell state");
+                    state.screen_on();
+                    suspend_coordinator.fail_sleep("unsafe_shell_state");
+                    raise_shell(&conn, shell_window)?;
+                    renderer.render(&conn, &state)?;
+                    state.redraw = false;
+                    conn.flush()?;
+                } else {
+                    // The lock frame and every app unmap are already flushed.
+                    // Only then may device-local hardware be powered down.
+                    let result = power_down_display(&mut backlight, touchscreen.as_ref());
+                    match result {
+                        Ok(()) => suspend_coordinator.complete_sleep(),
+                        Err(code) => {
+                            eprintln!("screen-off transaction failed: {code}");
+                            if let Some(device) = touchscreen.as_ref() {
+                                let _ = device.on();
+                            }
+                            if let Some(device) = backlight.as_ref() {
+                                let _ = device.on();
+                            }
+                            state.screen_on();
+                            suspend_coordinator.fail_sleep(code);
+                            raise_shell(&conn, shell_window)?;
+                            renderer.render(&conn, &state)?;
+                            state.redraw = false;
+                            conn.flush()?;
+                        }
+                    }
+                }
+            }
+            SuspendAction::Wake => {
+                // Waking is also transactional: the complete lock frame is
+                // presented while the panel is dark, before either input or
+                // brightness is restored.
+                raise_shell(&conn, shell_window)?;
+                renderer.render(&conn, &state)?;
+                state.redraw = false;
+                conn.flush()?;
+                match power_up_display(backlight.as_ref(), touchscreen.as_ref()) {
+                    Ok(()) => suspend_coordinator.complete_wake(),
+                    Err(code) => {
+                        eprintln!("screen-on transaction failed: {code}");
+                        suspend_coordinator.fail_wake(code);
+                    }
+                }
+            }
+        }
         let now = Instant::now();
         let mut deadline = next_device_status.min(next_memory_status);
         if apps.browser_running() {
@@ -662,6 +685,43 @@ fn heartbeat_is_recent(path: &Path, maximum_age: Duration) -> bool {
         // writes.
         Err(_) => true,
     }
+}
+
+fn safe_to_power_down(state: &ShellState, apps: &AppRegistry) -> bool {
+    state.view == View::Locked
+        && !state.screen_awake
+        && !state.keyboard.is_visible()
+        && state.pointer.is_none()
+        && state.managed_windows.is_empty()
+        && apps.active().is_none()
+}
+
+fn power_down_display(
+    backlight: &mut Option<Backlight>,
+    touchscreen: Option<&TouchscreenPower>,
+) -> Result<(), &'static str> {
+    let Some(backlight) = backlight.as_mut() else {
+        return Err("backlight_unavailable");
+    };
+    backlight.off().map_err(|_| "backlight_sleep_failed")?;
+    let Some(touchscreen) = touchscreen else {
+        return Err("touchscreen_unavailable");
+    };
+    touchscreen.off().map_err(|_| "touchscreen_sleep_failed")
+}
+
+fn power_up_display(
+    backlight: Option<&Backlight>,
+    touchscreen: Option<&TouchscreenPower>,
+) -> Result<(), &'static str> {
+    let Some(touchscreen) = touchscreen else {
+        return Err("touchscreen_unavailable");
+    };
+    touchscreen.on().map_err(|_| "touchscreen_wake_failed")?;
+    let Some(backlight) = backlight else {
+        return Err("backlight_unavailable");
+    };
+    backlight.on().map_err(|_| "backlight_wake_failed")
 }
 
 fn next_input_deadline(state: &ShellState, raw_touch: &RawTouchTracker) -> Option<Instant> {

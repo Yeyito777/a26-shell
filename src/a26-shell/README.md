@@ -74,6 +74,14 @@ keyboard repeat, gesture recovery, launch animation, status/heartbeat checks,
 lease expiry, and UI deadlines. If an older kernel cannot create a pidfd, only
 that process uses a bounded 250 ms status fallback. There is no idle 8 ms spin.
 
+Screen-off is a device-local transaction. Moon first enters the lock view,
+clears input/keyboard state, unmaps the active app, flushes Xorg, and verifies
+that no app window remains active. Only then does it set panel brightness to zero
+and send Samsung's touchscreen display-off event. Wake presents a complete lock
+frame while dark before restoring touch and brightness. Any preparation or
+hardware error rolls back to an awake locked state and is exposed as a fixed
+error code in `state.suspend`, never as a half-completed transition.
+
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
 design. IPC access is restricted to the root-owned chroot runtime.

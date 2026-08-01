@@ -127,10 +127,14 @@ after="$(field volume <<<"$($CTL state)")"
 state="$($CTL state)"
 [[ "$(field view <<<"$state")" == locked ]]
 [[ "$(field screen_awake <<<"$state")" == false ]]
+python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; assert d["suspend"]["phase"] == "screen_off" and d["suspend"]["hardware_awake"] is False and d["suspend"]["last_error"] is None; assert d["managed_windows"] == []' <<<"$state"
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /sys/class/backlight/panel/brightness"' | tr -d '\r')" == 0 ]]
 "$CTL" screen on >/dev/null
 state="$($CTL state)"
 [[ "$(field view <<<"$state")" == locked ]]
 [[ "$(field screen_awake <<<"$state")" == true ]]
+python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; assert d["suspend"]["phase"] == "awake" and d["suspend"]["hardware_awake"] is True and d["suspend"]["last_error"] is None' <<<"$state"
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /sys/class/backlight/panel/brightness"' | tr -d '\r')" -gt 0 ]]
 
 "$CTL" lock >/dev/null
 state="$($CTL state)"

@@ -9,6 +9,7 @@ use crate::keyboard::{
     KeyAction, KeyboardEffect, KeyboardPurpose, KeyboardState, PublicKeyboardState,
 };
 use crate::lease::PublicLeaseState;
+use crate::suspend::PublicSuspendState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +153,7 @@ pub struct PublicState {
     pub app_launching: bool,
     pub apps: Vec<PublicAppState>,
     pub keyboard: PublicKeyboardState,
+    pub suspend: PublicSuspendState,
 }
 
 impl ShellState {
@@ -183,7 +185,13 @@ impl ShellState {
         }
     }
 
-    pub fn public(&self, width: u16, height: u16, apps: Vec<PublicAppState>) -> PublicState {
+    pub fn public(
+        &self,
+        width: u16,
+        height: u16,
+        apps: Vec<PublicAppState>,
+        suspend: PublicSuspendState,
+    ) -> PublicState {
         let remaining = self
             .lockout_until
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -213,6 +221,7 @@ impl ShellState {
             app_launching: self.app_launching(),
             apps,
             keyboard: self.keyboard.public(),
+            suspend,
         }
     }
 
@@ -559,6 +568,15 @@ mod tests {
         }
     }
 
+    fn public(state: &ShellState) -> PublicState {
+        state.public(
+            1080,
+            2340,
+            Vec::new(),
+            crate::suspend::SuspendCoordinator::new(true).public(),
+        )
+    }
+
     #[test]
     fn correct_pin_unlocks() {
         let config = test_config();
@@ -603,10 +621,7 @@ mod tests {
         let mut state = ShellState::new(false, 50);
         state.launch_browser();
         assert_eq!(state.view, View::Browser);
-        assert_eq!(
-            state.public(1080, 2340, Vec::new()).current_app,
-            Some("Browser")
-        );
+        assert_eq!(public(&state).current_app, Some("Browser"));
         assert!(state.view.is_app());
         assert!(state.app_launching());
 
@@ -623,7 +638,7 @@ mod tests {
         state.launch_system();
         assert_eq!(state.view, View::System);
         assert!(!state.app_launching());
-        assert!(!state.public(1080, 2340, Vec::new()).app_launching);
+        assert!(!public(&state).app_launching);
     }
 
     #[test]
@@ -662,7 +677,7 @@ mod tests {
         assert!(!state.active_app_focused());
         state.set_active_app_focused(true);
         assert!(state.active_app_focused());
-        assert!(state.public(1080, 2340, Vec::new()).app_focused);
+        assert!(public(&state).app_focused);
 
         state.set_active_app_focused(false);
         assert!(!state.active_app_focused());
@@ -684,7 +699,7 @@ mod tests {
             KeyboardEffect::Inject(crate::keyboard::KeyboardInput::Character('x'))
         ));
 
-        let public = serde_json::to_value(state.public(1080, 2340, Vec::new())).unwrap();
+        let public = serde_json::to_value(public(&state)).unwrap();
         assert_eq!(
             public.get("keyboard").unwrap(),
             &serde_json::json!({
@@ -706,7 +721,7 @@ mod tests {
         state.launch_system();
         assert_eq!(state.view, View::Locked);
         assert!(!state.keyboard.is_visible());
-        assert_eq!(state.public(1080, 2340, Vec::new()).current_app, None);
+        assert_eq!(public(&state).current_app, None);
         assert_eq!(state.last_action, "keyboard_show_blocked");
     }
 }
