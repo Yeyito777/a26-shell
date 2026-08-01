@@ -39,6 +39,7 @@ struct Application {
     lifecycle: AppLifecycle,
     windows: Vec<ManagedWindow>,
     freezer: FreezerGroup,
+    last_used: Instant,
 }
 
 impl Application {
@@ -50,6 +51,7 @@ impl Application {
             lifecycle: AppLifecycle::Stopped,
             windows: Vec::new(),
             freezer: FreezerGroup::prepare(id),
+            last_used: Instant::now(),
         }
     }
 
@@ -57,7 +59,7 @@ impl Application {
         self.child.as_ref().map(Child::id)
     }
 
-    fn public(&self, leases: Vec<PublicLeaseState>) -> PublicAppState {
+    fn public(&self, leases: Vec<PublicLeaseState>, now: Instant) -> PublicAppState {
         PublicAppState {
             app: self.id,
             lifecycle: self.lifecycle,
@@ -66,6 +68,10 @@ impl Application {
             freezer_cgroup: self.freezer.public_path(),
             freezer_state: self.freezer.state(),
             leases,
+            last_used_ms_ago: now
+                .saturating_duration_since(self.last_used)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
         }
     }
 
@@ -76,8 +82,16 @@ impl Application {
                 self.id.display_name()
             );
         }
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
+        }
+        if let Err(error) = self.freezer.terminate_all() {
+            eprintln!(
+                "cannot terminate complete {} cgroup: {error}",
+                self.id.display_name()
+            );
+        }
+        if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
         self.lifecycle = AppLifecycle::Stopped;
@@ -122,7 +136,7 @@ impl AppRegistry {
         let now = Instant::now();
         self.applications
             .iter()
-            .map(|application| application.public(self.leases.public(application.id, now)))
+            .map(|application| application.public(self.leases.public(application.id, now), now))
             .collect()
     }
 
@@ -312,6 +326,7 @@ impl AppRegistry {
                     return update;
                 }
                 application.lifecycle = AppLifecycle::Foreground;
+                application.last_used = now;
                 for window in &mut application.windows {
                     if !window.visible {
                         window.visible = true;
@@ -347,6 +362,7 @@ impl AppRegistry {
                         application.child = Some(process);
                         application.freezer.note_spawned();
                         application.lifecycle = AppLifecycle::Launching;
+                        application.last_used = now;
                     }
                     Err(error) => {
                         eprintln!("cannot start {}: {error}", application.executable.display());
@@ -419,6 +435,23 @@ impl AppRegistry {
             // subject to the same five-second bounded media lease as IPC.
             let _ = self.acquire_lease(AppId::Browser, LeaseKind::Media, 5, now);
         }
+    }
+
+    pub fn evict_lru_background(&mut self, now: Instant) -> Option<AppId> {
+        self.leases.expire(now);
+        let mut candidate: Option<(AppId, Instant)> = None;
+        for id in [AppId::System, AppId::Browser] {
+            let background = self.app(id).lifecycle == AppLifecycle::Background;
+            let leased = self.leases.active(id, now);
+            let last_used = self.app(id).last_used;
+            if background && !leased && candidate.is_none_or(|(_, oldest)| last_used < oldest) {
+                candidate = Some((id, last_used));
+            }
+        }
+        let candidate = candidate?.0;
+        self.leases.clear_app(candidate);
+        self.app_mut(candidate).stop();
+        Some(candidate)
     }
 
     fn app(&self, id: AppId) -> &Application {
@@ -510,5 +543,35 @@ mod tests {
         assert_eq!(public.len(), 1);
         assert_eq!(public[0].kind, LeaseKind::Media);
         registry.shutdown();
+    }
+
+    #[test]
+    fn memory_pressure_evicts_oldest_unleased_background_app() {
+        let mut registry = registry();
+        let now = Instant::now();
+        for id in [AppId::System, AppId::Browser] {
+            registry.app_mut(id).lifecycle = AppLifecycle::Background;
+            registry.app_mut(id).child =
+                Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());
+        }
+        registry.app_mut(AppId::System).last_used = now - Duration::from_secs(20);
+        registry.app_mut(AppId::Browser).last_used = now - Duration::from_secs(10);
+        registry
+            .acquire_lease(AppId::System, LeaseKind::Transfer, 10, now)
+            .unwrap();
+
+        assert_eq!(registry.evict_lru_background(now), Some(AppId::Browser));
+        assert_eq!(
+            registry.app(AppId::Browser).lifecycle,
+            AppLifecycle::Stopped
+        );
+        assert_eq!(
+            registry.app(AppId::System).lifecycle,
+            AppLifecycle::Background
+        );
+        registry
+            .release_lease(AppId::System, LeaseKind::Transfer, now)
+            .unwrap();
+        assert_eq!(registry.evict_lru_background(now), Some(AppId::System));
     }
 }

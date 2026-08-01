@@ -7,6 +7,7 @@ mod input;
 mod ipc;
 mod keyboard;
 mod lease;
+mod memory;
 mod model;
 mod status;
 mod status_bar;
@@ -47,6 +48,7 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const MEDIA_ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
 const MEDIA_ACTIVITY_MAX_AGE: Duration = Duration::from_secs(2);
+const MEMORY_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const MAX_REPEAT_CATCH_UP: usize = 8;
 const STALE_POINTER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -237,6 +239,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let mut next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
     let mut next_media_activity = Instant::now();
+    let mut next_memory_status = Instant::now() + MEMORY_STATUS_INTERVAL;
     let mut next_launch_animation = Instant::now();
     let mut power_key = match PowerKey::open("/dev/input/event1") {
         Ok(device) => {
@@ -368,6 +371,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Command::LeaseRelease(app, kind) => {
                             apps.release_lease(*app, *kind, Instant::now())
                         }
+                        Command::SimulateMemoryPressure => {
+                            if let Some(app) = apps.evict_lru_background(Instant::now()) {
+                                state.note_memory_eviction(app);
+                            }
+                            Ok(())
+                        }
                         _ => Ok(()),
                     };
                     if let Err(error) = lease_result {
@@ -412,6 +421,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 apps.renew_browser_media_activity(now);
             }
             next_media_activity = now + MEDIA_ACTIVITY_INTERVAL;
+        }
+        if now >= next_memory_status {
+            match memory::MemorySnapshot::read() {
+                Ok(snapshot) if snapshot.under_pressure() => {
+                    if let Some(app) = apps.evict_lru_background(now) {
+                        eprintln!(
+                            "evicted {} under memory pressure available={} total={}",
+                            app.display_name(),
+                            snapshot.available_bytes,
+                            snapshot.total_bytes
+                        );
+                        state.note_memory_eviction(app);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("memory status unavailable: {error}"),
+            }
+            next_memory_status = now + MEMORY_STATUS_INTERVAL;
         }
 
         let desired_app = AppId::from_view(state.view);
@@ -1647,7 +1674,9 @@ fn apply_command(
         Command::Power => state.toggle_screen(),
         Command::ScreenOff => state.screen_off(),
         Command::ScreenOn => state.screen_on(),
-        Command::LeaseAcquire(_, _, _) | Command::LeaseRelease(_, _) => {}
+        Command::LeaseAcquire(_, _, _)
+        | Command::LeaseRelease(_, _)
+        | Command::SimulateMemoryPressure => {}
         Command::Quit => state.should_exit = true,
     }
 }

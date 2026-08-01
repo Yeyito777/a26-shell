@@ -134,6 +134,13 @@ state="$($CTL state)"
 [[ "$(field view <<<"$state")" == locked ]]
 [[ "$(field pin_digits <<<"$state")" == 0 ]]
 
+# Deterministically exercise the same one-victim LRU path used by real
+# MemAvailable pressure, without allocating memory on the phone.
+"$CTL" memory-pressure simulate >/dev/null
+state="$($CTL state)"
+python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; app=next(a for a in d["apps"] if a["app"] == "system"); assert app["lifecycle"] == "stopped" and app["pid"] is None; assert d["last_action"] == "system_evicted_memory_pressure"' <<<"$state"
+[[ -z "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/cgroup.procs"' | tr -d '\r')" ]]
+
 mkdir -p "$PROJECT_ROOT/notes/a26-shell"
 printf '%s\n' "$state" >"$PROJECT_ROOT/notes/a26-shell/final-state.json"
 adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -root -tree; echo; DISPLAY=:0 xinput --list --long A26-Touchscreen'\''"' >"$PROJECT_ROOT/notes/a26-shell/x11-window-and-touch-proof.txt"

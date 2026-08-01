@@ -4,7 +4,7 @@
 4. [x] Unfreeze and remap background apps for instant reopening.
 5. [x] Add bounded background-execution leases for media and transfers.
 6. [x] Connect Vimbrowser media playback state to Moon’s lease protocol.
-7. Add memory-pressure eviction of least-recently-used background apps.
+7. [x] Add memory-pressure eviction of least-recently-used background apps.
 8. Replace Moon’s idle 8 ms polling with blocking event waits.
 9. Add a device-local suspend coordinator with safe lock, display, and app sequencing.
 10. Enter deep suspend on screen-off and wake safely from approved hardware sources.

@@ -36,6 +36,7 @@ pub enum Command {
     ScreenOn,
     LeaseAcquire(AppId, LeaseKind, u64),
     LeaseRelease(AppId, LeaseKind),
+    SimulateMemoryPressure,
     Quit,
 }
 
@@ -229,6 +230,11 @@ fn parse_command(line: &str) -> Result<Command, String> {
                 _ => return Err("lease requires acquire or release".into()),
             }
         }
+        "memory-pressure" => match parts.next() {
+            Some("simulate") => Command::SimulateMemoryPressure,
+            Some(_) => return Err("memory-pressure requires simulate".into()),
+            None => return Err("memory-pressure requires simulate".into()),
+        },
         _ => return Err(format!("unknown command: {name}")),
     };
     no_extra(parts)?;
@@ -265,5 +271,15 @@ mod tests {
         ));
         assert!(parse_command("lease acquire browser arbitrary 5").is_err());
         assert!(parse_command("lease release browser media extra").is_err());
+    }
+
+    #[test]
+    fn memory_pressure_simulation_is_an_exact_root_control() {
+        assert!(matches!(
+            parse_command("memory-pressure simulate"),
+            Ok(Command::SimulateMemoryPressure)
+        ));
+        assert!(parse_command("memory-pressure").is_err());
+        assert!(parse_command("memory-pressure kill browser").is_err());
     }
 }

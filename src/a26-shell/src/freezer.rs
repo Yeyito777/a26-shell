@@ -119,6 +119,36 @@ impl FreezerGroup {
         Ok(())
     }
 
+    pub fn terminate_all(&self) -> io::Result<()> {
+        if !self.assigned {
+            return Ok(());
+        }
+        self.thaw()?;
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let processes = fs::read_to_string(path.join("cgroup.procs"))?;
+        let current = std::process::id();
+        for pid in processes
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+        {
+            if pid == current {
+                continue;
+            }
+            // SAFETY: kill has no pointer preconditions. ESRCH is harmless when
+            // a helper exits between the cgroup snapshot and this signal.
+            let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn public_path(&self) -> Option<String> {
         self.assigned.then(|| self.public_path.clone()).flatten()
     }

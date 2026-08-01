@@ -83,6 +83,7 @@ pub struct PublicAppState {
     pub freezer_cgroup: Option<String>,
     pub freezer_state: FreezerState,
     pub leases: Vec<PublicLeaseState>,
+    pub last_used_ms_ago: u64,
 }
 
 impl View {
@@ -280,6 +281,14 @@ impl ShellState {
             AppId::Browser => "browser_resumed",
         }
         .into();
+        self.redraw = true;
+    }
+
+    pub fn note_memory_eviction(&mut self, app: AppId) {
+        self.last_action = format!(
+            "{}_evicted_memory_pressure",
+            app.display_name().to_ascii_lowercase()
+        );
         self.redraw = true;
     }
 

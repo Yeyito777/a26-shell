@@ -61,6 +61,13 @@ stops renewal and refreezes the hidden Browser after expiry. Lease state exposes
 only the fixed purpose and remaining duration through `state`; no URL, title,
 media metadata, or samples enter lifecycle state.
 
+Every five seconds Moon reads `MemAvailable`. Below the larger of 384 MiB or ten
+percent of physical RAM, it evicts one least-recently-used background app that
+has no active lease. The complete freezer cgroup is killed, not merely its leader,
+so Chromium helpers cannot survive unsupervised. Foreground and leased apps are
+never candidates. The root-only `memory-pressure simulate` control runs the same
+single-victim policy for deterministic device testing without allocating memory.
+
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
 design. IPC access is restricted to the root-owned chroot runtime.
