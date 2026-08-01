@@ -223,20 +223,130 @@ start_moon() {
         /usr/bin/env DISPLAY=:0 A26_SHELL_CONFIG=/etc/a26-shell/config.json \
         /opt/a26-shell/bin/a26-shell \
         >>"$ROOT/root/a26-shell.log" 2>&1 </dev/null &
+    session_pid=$!
+    echo "$session_pid" >"$RUNTIME/moon-session.pid.new"
+    chmod 0600 "$RUNTIME/moon-session.pid.new"
+    mv -f "$RUNTIME/moon-session.pid.new" "$RUNTIME/moon-session.pid"
+}
+
+moon_control() {
+    # A live PID is insufficient: a synchronous X11 wait can leave the process
+    # sleeping forever while its UI and control socket are both unresponsive.
+    # Bound every probe so the supervisor itself can never join that deadlock.
+    probe_timeout="${1:?probe timeout required}"
+    shift
+    "$BB" timeout -s KILL "$probe_timeout" "$BB" chroot "$ROOT" \
+        /opt/a26-shell/bin/a26-shellctl "$@"
+}
+
+capture_moon_incident() {
+    incident_dir="$PERSIST/incidents"
+    mkdir -p "$incident_dir"
+    incident="$incident_dir/moon-unresponsive-$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)-$$.log"
+    incident_new="$incident.new"
+    moon_pid="$(pidof a26-shell 2>/dev/null | tr ' ' '\n' | head -n 1)"
+    xorg_pid="$(pidof Xorg 2>/dev/null | tr ' ' '\n' | head -n 1)"
+    {
+        echo 'schema=1'
+        echo "captured=$(date --iso-8601=seconds 2>/dev/null || date)"
+        echo "moon_pid=$moon_pid"
+        if [ -n "$moon_pid" ]; then
+            printf 'moon_wchan='
+            cat "/proc/$moon_pid/wchan" 2>/dev/null || true
+            echo
+            echo '[moon_stack]'
+            cat "/proc/$moon_pid/stack" 2>/dev/null || true
+            echo '[moon_status]'
+            grep -E '^(Name|State|Pid|PPid|Threads|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' \
+                "/proc/$moon_pid/status" 2>/dev/null || true
+        fi
+        echo "xorg_pid=$xorg_pid"
+        if [ -n "$xorg_pid" ]; then
+            printf 'xorg_wchan='
+            cat "/proc/$xorg_pid/wchan" 2>/dev/null || true
+            echo
+            echo '[xorg_stack]'
+            cat "/proc/$xorg_pid/stack" 2>/dev/null || true
+        fi
+        echo '[moon_log_tail]'
+        tail -n 200 "$ROOT/root/a26-shell.log" 2>/dev/null || true
+    } >"$incident_new"
+    chmod 0600 "$incident_new"
+    mv -f "$incident_new" "$incident"
+    log "captured unresponsive Moon diagnostics at $incident"
+
+    # Keep diagnostics useful without allowing a recurring fault to consume
+    # unbounded persistent storage.
+    incident_count=0
+    for old_incident in $(ls -1t "$incident_dir"/moon-unresponsive-*.log 2>/dev/null || true); do
+        incident_count=$((incident_count + 1))
+        [ "$incident_count" -le 10 ] || rm -f "$old_incident"
+    done
+}
+
+stop_moon_session() {
+    session_pid="$(cat "$RUNTIME/moon-session.pid" 2>/dev/null || true)"
+    case "$session_pid" in
+        ''|*[!0-9]*)
+            log 'Moon session PID is missing or invalid'
+            return 1
+            ;;
+    esac
+    # Refuse a stale/reused ID. setsid makes both process-group and session IDs
+    # equal to the recorded launch PID. The leader can already have exited while
+    # a Chromium descendant remains, so verify any surviving member rather than
+    # requiring /proc/$session_pid itself.
+    session_verified=0
+    for process_stat in /proc/[0-9]*/stat; do
+        set -- $(cat "$process_stat" 2>/dev/null || true)
+        if [ "${5:-}" = "$session_pid" ] && [ "${6:-}" = "$session_pid" ]; then
+            session_verified=1
+            break
+        fi
+    done
+    if [ "$session_verified" != 1 ]; then
+        rm -f "$RUNTIME/moon-session.pid"
+        return 0
+    fi
+    kill -TERM "-$session_pid" 2>/dev/null || true
+    for _ in $($BB seq 1 25); do
+        kill -0 "-$session_pid" 2>/dev/null || break
+        "$BB" sleep 0.2
+    done
+    kill -0 "-$session_pid" 2>/dev/null && kill -KILL "-$session_pid" 2>/dev/null || true
+    wait "$session_pid" 2>/dev/null || true
+    rm -f "$RUNTIME/moon-session.pid"
+}
+
+wait_for_moon() {
+    # Twenty one-second probes plus short spacing bound initial/recovery startup
+    # to approximately 24 seconds, rather than multiplying a five-second probe
+    # by 100 attempts.
+    for _ in $($BB seq 1 20); do
+        if moon_control 1 ping >"$RUNTIME/moon-state.new" 2>/dev/null; then
+            mv -f "$RUNTIME/moon-state.new" "$RUNTIME/moon-state"
+            return 0
+        fi
+        "$BB" sleep 0.2
+    done
+    rm -f "$RUNTIME/moon-state.new"
+    return 1
+}
+
+restart_moon_after_incident() {
+    capture_moon_incident
+    stop_moon_session || return 1
+    start_moon
+    if wait_for_moon; then
+        log 'Moon recovered locally after an unresponsive-process incident'
+        return 0
+    fi
+    log 'Moon local recovery failed'
+    return 1
 }
 
 start_moon
-moon_ready=0
-for _ in $($BB seq 1 100); do
-    if "$BB" chroot "$ROOT" /opt/a26-shell/bin/a26-shellctl state \
-        >"$RUNTIME/moon-state.new" 2>/dev/null; then
-        mv -f "$RUNTIME/moon-state.new" "$RUNTIME/moon-state"
-        moon_ready=1
-        break
-    fi
-    "$BB" sleep 0.2
-done
-if [ "$moon_ready" != 1 ]; then
+if ! wait_for_moon; then
     log 'Moon control socket did not become ready; restoring Android'
     /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh
     exit 31
@@ -247,7 +357,8 @@ echo "$boot_id" >"$PERSIST/last-success-boot-id"
 chmod 0600 "$PERSIST/last-success-boot-id"
 log 'Moon is the active default session'
 
-shell_missing=0
+shell_unhealthy=0
+local_recoveries=0
 while [ -n "$(pidof Xorg 2>/dev/null || true)" ]; do
     sleep 30
     if [ -e "$PERSIST/disabled" ]; then
@@ -261,15 +372,26 @@ while [ -n "$(pidof Xorg 2>/dev/null || true)" ]; do
         /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh
         break
     fi
-    if [ -z "$(pidof a26-shell 2>/dev/null || true)" ]; then
-        shell_missing=$((shell_missing + 1))
-        if [ "$shell_missing" -ge 2 ]; then
-            log 'Moon process remained absent; restoring Android'
-            /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh
-            break
-        fi
+    if moon_control 5 ping >/dev/null 2>&1; then
+        shell_unhealthy=0
     else
-        shell_missing=0
+        shell_unhealthy=$((shell_unhealthy + 1))
+        log "Moon liveness probe failed ($shell_unhealthy/2)"
+        if [ "$shell_unhealthy" -ge 2 ]; then
+            if [ "$local_recoveries" -ge 1 ]; then
+                capture_moon_incident
+                log 'Moon exceeded the one-recovery-per-boot budget; restoring Android'
+                /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh
+                break
+            elif restart_moon_after_incident; then
+                local_recoveries=$((local_recoveries + 1))
+                shell_unhealthy=0
+            else
+                log 'Moon remained unavailable; restoring Android'
+                /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh
+                break
+            fi
+        fi
     fi
 done
 

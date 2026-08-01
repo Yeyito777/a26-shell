@@ -71,6 +71,9 @@ tmpfs_mount() {
 cleanup() {
     status=$?
     trap - EXIT HUP INT TERM
+    if [ -n "${RUNTIME_RESOLV_NEW:-}" ]; then
+        $BB rm -f "$RUNTIME_RESOLV_NEW"
+    fi
     for target_path in $MOUNTS; do
         if mounted "$target_path"; then
             $BB umount "$target_path" || {
@@ -104,24 +107,27 @@ fi
 # Android commonly has no useful /etc/resolv.conf.  Prefer any actual host
 # nameserver, then legacy net.dns properties, then explicit public fallbacks.
 RUNTIME_RESOLV="$A26_ROOT/run/a26-resolv.conf"
-: >"$RUNTIME_RESOLV"
+RUNTIME_RESOLV_NEW="$RUNTIME_RESOLV.new.$$"
+: >"$RUNTIME_RESOLV_NEW"
 if [ -n "${A26_DNS:-}" ]; then
-    for ns in $A26_DNS; do echo "nameserver $ns" >>"$RUNTIME_RESOLV"; done
+    for ns in $A26_DNS; do echo "nameserver $ns" >>"$RUNTIME_RESOLV_NEW"; done
 elif [ -r /etc/resolv.conf ]; then
     $BB awk '/^[[:space:]]*nameserver[[:space:]]+/ { print; found=1 } END { exit !found }' \
-        /etc/resolv.conf >"$RUNTIME_RESOLV" 2>/dev/null || :
+        /etc/resolv.conf >"$RUNTIME_RESOLV_NEW" 2>/dev/null || :
 fi
-if ! $BB grep -q '^nameserver ' "$RUNTIME_RESOLV"; then
+if ! $BB grep -q '^nameserver ' "$RUNTIME_RESOLV_NEW"; then
     for prop in net.dns1 net.dns2; do
         ns="$(/system/bin/getprop "$prop" 2>/dev/null || true)"
-        [ -n "$ns" ] && echo "nameserver $ns" >>"$RUNTIME_RESOLV"
+        [ -n "$ns" ] && echo "nameserver $ns" >>"$RUNTIME_RESOLV_NEW"
     done
 fi
-if ! $BB grep -q '^nameserver ' "$RUNTIME_RESOLV"; then
-    echo 'nameserver 1.1.1.1' >>"$RUNTIME_RESOLV"
-    echo 'nameserver 8.8.8.8' >>"$RUNTIME_RESOLV"
+if ! $BB grep -q '^nameserver ' "$RUNTIME_RESOLV_NEW"; then
+    echo 'nameserver 1.1.1.1' >>"$RUNTIME_RESOLV_NEW"
+    echo 'nameserver 8.8.8.8' >>"$RUNTIME_RESOLV_NEW"
 fi
-echo 'options timeout:2 attempts:2' >>"$RUNTIME_RESOLV"
+echo 'options timeout:2 attempts:2' >>"$RUNTIME_RESOLV_NEW"
+$BB chmod 0644 "$RUNTIME_RESOLV_NEW"
+$BB mv -f "$RUNTIME_RESOLV_NEW" "$RUNTIME_RESOLV"
 bind_mount "$RUNTIME_RESOLV" "$A26_ROOT/etc/resolv.conf"
 
 TERM_VALUE="${TERM:-xterm-256color}"

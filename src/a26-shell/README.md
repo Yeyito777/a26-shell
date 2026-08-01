@@ -14,7 +14,9 @@ Current features:
 - external `a26-system` process launch and fullscreen lifecycle management;
 - external ARM64 vimbrowser launch and fullscreen lifecycle management;
 - hidden X11 cursor on touch-only shell and app surfaces;
-- bottom-edge swipe-up app close gesture;
+- a system-owned top safe-area bar that keeps apps below the camera cutout and
+  shows Wi-Fi/battery on the left with Moon identity on the right;
+- bottom-edge swipe-up app backgrounding with process and window preservation;
 - system-owned global on-screen keyboard for managed apps, with text, URL,
   search, password, and number purposes;
 - focus-independent physical volume-key handling, a global volume overlay, and
@@ -33,6 +35,14 @@ The standalone Browser app is vimbrowser. Its A26 installation provides
 `/opt/vimbrowser-a26/bin/vimbrowser-a26` and
 `/opt/vimbrowser-a26/share/browser-app.bgrx`; the shell only owns the launcher
 tile and process lifecycle.
+
+Moon keeps a lifecycle-aware registry for each app (`stopped`, `launching`,
+`foreground`, or `background`). Swiping up unmaps the app's windows and returns
+to the launcher without terminating its process. Reopening the app remaps the
+same windows and preserves its PID and in-memory state. The later freezer-cgroup
+milestone will suspend CPU use while an app remains in this background state.
+Moon still terminates all registered children during an intentional shell
+shutdown so an upgrade cannot leave unsupervised processes behind.
 
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
@@ -79,7 +89,7 @@ The keyboard is Moon system UI, not part of Browser or System. It is a dedicated
 lower-screen override-redirect X11 window above the active managed app. Moon's
 existing XI2 raw-touch path consumes touches in the key panel before its normal
 app tap forwarding. The bottom 180 physical pixels contain no keys and remain
-available as the global swipe-to-close start zone.
+available as the global swipe-to-background start zone.
 
 English (US) uses the familiar four-row iPhone portrait arrangement: staggered
 QWERTY letter rows, wider Shift/Delete controls, standard `123` and `#+=`
@@ -122,12 +132,18 @@ keyboard hide
 ```
 
 There is no keyboard event socket. Moon leaves X focus on the app and emits each
-key through XTEST using the server keyboard and modifier maps. A short physical
-press interval is retained between key down and key up. The Browser target has a
-narrow A26-only CEF compatibility path that turns the resulting raw printable key
-into the missing renderer CHAR event; no typed value crosses IPC or enters a Moon
-buffer. A managed app can dismiss the keyboard explicitly over IPC or by ending
-its editable-field focus; Moon also hides it on every security/app transition.
+key through XTEST using the server keyboard and modifier maps. Runtime input is
+strictly one-way: Moon tracks focus through FocusIn/FocusOut events on managed
+app windows, preserves the exact focused descendant/transient, queues key-down
+and key-up requests, and flushes. It never waits for an X11 reply or checked
+cookie from its long-lived event-loop connection. This avoids 16-bit X11
+sequence-epoch ambiguity after long sessions;
+one such wrapped reply wait was captured live and had frozen the entire shell
+while typing. The Browser target has a narrow A26-only CEF compatibility path
+that turns the resulting raw printable key into the missing renderer CHAR event;
+no typed value crosses IPC or enters a Moon buffer. A managed app can dismiss the
+keyboard explicitly over IPC or by ending its editable-field focus; Moon also
+hides it on every security/app transition.
 
 App taps use XTEST pointer injection as well. This lets the X server hit-test into
 embedded descendant windows such as Chromium's page surface instead of sending a
@@ -150,6 +166,16 @@ keyboard.
 Moon never builds a text buffer for app input. In particular, password keys are
 resolved and injected one at a time, are never included in diagnostics, and are
 never present in public state.
+
+## App safe area
+
+Managed apps begin at physical Y=124 rather than drawing underneath the A26's
+camera cutout. Moon owns that 124-pixel strip as a separate override-redirect,
+double-buffered X11 surface: Wi-Fi and battery remain in the left safe region,
+`MOON` remains in the right safe region, and the center cutout region stays
+visually quiet. App height is reduced exactly once. When the global keyboard is
+visible, the app occupies Y=124 through the keyboard's physical top edge, so the
+browser's bottom navigation continues to meet the keyboard with no gap.
 
 Development lifecycle from the project root:
 
@@ -189,6 +215,11 @@ Safety policy:
 - require at least 20% battery before takeover;
 - restore Android charging mode at 8%;
 - verify Xorg and Moon using phone-local status/control paths;
+- probe Moon's control loop every 30 seconds with a five-second hard timeout;
+- after two failed probes, save root-only process/kernel-stack diagnostics and
+  restart Moon's recorded process group locally;
+- permit one local recovery per boot, retain at most ten incident reports, and
+  restore Android if Moon fails again or the bounded recovery does not start;
 - authorize and verify the AudioTrack bridge before suspending system_server;
 - clean native Wi-Fi before restoring Android;
 - press a volume key during the eight-second override window to skip Moon once;

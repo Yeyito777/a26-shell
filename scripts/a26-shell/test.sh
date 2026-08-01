@@ -67,13 +67,22 @@ done
 "$CTL" pointer-end 540 1690 >/dev/null
 state="$($CTL state)"
 [[ "$(field view <<<"$state")" == launcher ]]
-[[ "$(field last_action <<<"$state")" == swipe_up_close ]]
+[[ "$(field last_action <<<"$state")" == swipe_up_background ]]
+background_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')"
+[[ "$background_pid" == "$app_pid" ]]
+background_window="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -name a26-system 2>/dev/null || true'\''"' | tr -d '\r')"
+grep -q 'Map State: IsUnMapped' <<<"$background_window"
+
+# Reopening resumes the same process and remaps its existing window.
+"$CTL" launch system >/dev/null
 for _ in $(seq 1 50); do
-    app_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')"
-    [[ -z "$app_pid" ]] && break
+    resumed_window="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -name a26-system 2>/dev/null || true'\''"' | tr -d '\r')"
+    grep -q 'Map State: IsViewable' <<<"$resumed_window" && break
     sleep 0.1
 done
-[[ -z "$app_pid" ]]
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')" == "$background_pid" ]]
+grep -q 'Map State: IsViewable' <<<"$resumed_window"
+"$CTL" swipe-up >/dev/null
 
 before="$(field volume <<<"$state")"
 "$CTL" volume up >/dev/null
@@ -98,7 +107,7 @@ state="$($CTL state)"
 mkdir -p "$PROJECT_ROOT/notes/a26-shell"
 printf '%s\n' "$state" >"$PROJECT_ROOT/notes/a26-shell/final-state.json"
 adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -root -tree; echo; DISPLAY=:0 xinput --list --long A26-Touchscreen'\''"' >"$PROJECT_ROOT/notes/a26-shell/x11-window-and-touch-proof.txt"
-grep -q 'a26-shell-ui' "$PROJECT_ROOT/notes/a26-shell/x11-window-and-touch-proof.txt"
+grep -q 'moon-shell' "$PROJECT_ROOT/notes/a26-shell/x11-window-and-touch-proof.txt"
 grep -q 'Max number of touches: 10' "$PROJECT_ROOT/notes/a26-shell/x11-window-and-touch-proof.txt"
 
 echo "A26_SHELL_INTEGRATION_TEST=PASS"

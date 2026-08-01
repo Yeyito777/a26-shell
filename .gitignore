@@ -4,6 +4,7 @@
 !/.gitignore
 !/LICENSE
 !/README.md
+!/TODO.md
 !/src/
 !/scripts/
 !/notes/
@@ -33,6 +34,7 @@
 /notes/a26-shell/*
 !/notes/a26-shell/README.md
 !/notes/a26-shell/APPLE-KEYBOARD-LAYOUT.md
+!/notes/a26-shell/X11-INPUT-DEADLOCK.md
 !/notes/a26-shell/launcher-redesign.png
 !/notes/a26-shell/system-view.png
 !/notes/a26-shell/ui-redesign-verification.txt

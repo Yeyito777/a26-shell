@@ -17,6 +17,54 @@ pub enum View {
     Browser,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppId {
+    System,
+    Browser,
+}
+
+impl AppId {
+    pub fn from_view(view: View) -> Option<Self> {
+        match view {
+            View::System => Some(Self::System),
+            View::Browser => Some(Self::Browser),
+            View::Locked | View::Launcher => None,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Browser => "Browser",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::System => 0,
+            Self::Browser => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLifecycle {
+    Stopped,
+    Launching,
+    Foreground,
+    Background,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicAppState {
+    pub app: AppId,
+    pub lifecycle: AppLifecycle,
+    pub pid: Option<u32>,
+    pub windows: Vec<u32>,
+}
+
 impl View {
     pub fn is_app(self) -> bool {
         matches!(self, Self::System | Self::Browser)
@@ -48,6 +96,7 @@ pub struct ShellState {
     pub volume: u8,
     pub volume_overlay_until: Option<Instant>,
     pub battery_percent: Option<u8>,
+    pub battery_charging: bool,
     pub wifi_connected: bool,
     pub pointer: Option<PointerGesture>,
     pub last_action: String,
@@ -55,6 +104,7 @@ pub struct ShellState {
     pub should_exit: bool,
     pub managed_windows: Vec<u32>,
     pub keyboard: KeyboardState,
+    active_app_focused: bool,
     app_launch_started: Option<Instant>,
     app_window_mapped_at: Option<Instant>,
 }
@@ -77,7 +127,9 @@ pub struct PublicState {
     pub last_action: String,
     pub pointer_active: bool,
     pub managed_windows: Vec<u32>,
+    pub app_focused: bool,
     pub app_launching: bool,
+    pub apps: Vec<PublicAppState>,
     pub keyboard: PublicKeyboardState,
 }
 
@@ -96,6 +148,7 @@ impl ShellState {
             volume: initial_volume.min(100),
             volume_overlay_until: None,
             battery_percent: None,
+            battery_charging: false,
             wifi_connected: false,
             pointer: None,
             last_action: "startup".into(),
@@ -103,12 +156,13 @@ impl ShellState {
             should_exit: false,
             managed_windows: Vec::new(),
             keyboard: KeyboardState::default(),
+            active_app_focused: false,
             app_launch_started: None,
             app_window_mapped_at: None,
         }
     }
 
-    pub fn public(&self, width: u16, height: u16) -> PublicState {
+    pub fn public(&self, width: u16, height: u16, apps: Vec<PublicAppState>) -> PublicState {
         let remaining = self
             .lockout_until
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -134,7 +188,9 @@ impl ShellState {
             last_action: self.last_action.clone(),
             pointer_active: self.pointer.is_some(),
             managed_windows: self.managed_windows.clone(),
+            app_focused: self.active_app_focused,
             app_launching: self.app_launching(),
+            apps,
             keyboard: self.keyboard.public(),
         }
     }
@@ -144,6 +200,7 @@ impl ShellState {
         self.view = View::Locked;
         self.clear_pin();
         self.pointer = None;
+        self.active_app_focused = false;
         self.cancel_app_launch();
         self.last_action = "lock".into();
         self.redraw = true;
@@ -173,16 +230,44 @@ impl ShellState {
         if self.screen_awake && self.view != View::Locked {
             self.keyboard.hide();
             self.view = View::Launcher;
+            self.active_app_focused = false;
             self.cancel_app_launch();
             self.last_action = "home".into();
             self.redraw = true;
         }
     }
 
+    pub fn replace_managed_windows(&mut self, windows: Vec<u32>) {
+        self.managed_windows = windows;
+        if self.managed_windows.is_empty() {
+            self.active_app_focused = false;
+            self.hide_keyboard();
+        }
+    }
+
+    pub fn set_active_app_focused(&mut self, focused: bool) {
+        self.active_app_focused = focused && self.screen_awake && self.view.is_app();
+    }
+
+    pub fn active_app_focused(&self) -> bool {
+        self.active_app_focused
+    }
+
+    pub fn note_app_resumed(&mut self, app: AppId) {
+        self.cancel_app_launch();
+        self.last_action = match app {
+            AppId::System => "system_resumed",
+            AppId::Browser => "browser_resumed",
+        }
+        .into();
+        self.redraw = true;
+    }
+
     pub fn launch_system(&mut self) {
         if self.screen_awake && self.view != View::Locked && self.view != View::System {
             self.keyboard.hide();
             self.view = View::System;
+            self.active_app_focused = false;
             self.managed_windows.clear();
             self.cancel_app_launch();
             self.last_action = "launch_system".into();
@@ -194,6 +279,7 @@ impl ShellState {
         if self.screen_awake && self.view != View::Locked && self.view != View::Browser {
             self.keyboard.hide();
             self.view = View::Browser;
+            self.active_app_focused = false;
             self.begin_app_launch();
             self.last_action = "launch_browser".into();
             self.redraw = true;
@@ -312,20 +398,19 @@ impl ShellState {
         effect
     }
 
-    pub fn note_managed_window_closed(&mut self, window: u32) {
-        if self.managed_windows.first().copied() == Some(window) {
-            self.hide_keyboard();
-        }
-        self.managed_windows.retain(|managed| *managed != window);
-        if self.managed_windows.is_empty() {
-            self.hide_keyboard();
-        }
-    }
-
-    pub fn update_device_status(&mut self, battery_percent: Option<u8>, wifi_connected: bool) {
+    pub fn update_device_status(
+        &mut self,
+        battery_percent: Option<u8>,
+        battery_charging: bool,
+        wifi_connected: bool,
+    ) {
         let battery_percent = battery_percent.map(|value| value.min(100));
-        if self.battery_percent != battery_percent || self.wifi_connected != wifi_connected {
+        if self.battery_percent != battery_percent
+            || self.battery_charging != battery_charging
+            || self.wifi_connected != wifi_connected
+        {
             self.battery_percent = battery_percent;
+            self.battery_charging = battery_charging;
             self.wifi_connected = wifi_connected;
             self.redraw = true;
         }
@@ -476,7 +561,10 @@ mod tests {
         let mut state = ShellState::new(false, 50);
         state.launch_browser();
         assert_eq!(state.view, View::Browser);
-        assert_eq!(state.public(1080, 2340).current_app, Some("Browser"));
+        assert_eq!(
+            state.public(1080, 2340, Vec::new()).current_app,
+            Some("Browser")
+        );
         assert!(state.view.is_app());
         assert!(state.app_launching());
 
@@ -493,7 +581,7 @@ mod tests {
         state.launch_system();
         assert_eq!(state.view, View::System);
         assert!(!state.app_launching());
-        assert!(!state.public(1080, 2340).app_launching);
+        assert!(!state.public(1080, 2340, Vec::new()).app_launching);
     }
 
     #[test]
@@ -511,7 +599,7 @@ mod tests {
         state.launch_system();
         state.managed_windows.push(43);
         assert!(state.show_keyboard(KeyboardPurpose::Search));
-        state.note_managed_window_closed(43);
+        state.replace_managed_windows(Vec::new());
         assert!(!state.keyboard.is_visible());
 
         state.managed_windows.push(44);
@@ -519,6 +607,28 @@ mod tests {
         state.lock();
         assert_eq!(state.view, View::Locked);
         assert!(!state.keyboard.is_visible());
+    }
+
+    #[test]
+    fn app_focus_authorization_is_event_driven_and_fail_closed() {
+        let mut state = ShellState::new(false, 50);
+        state.set_active_app_focused(true);
+        assert!(!state.active_app_focused());
+
+        state.launch_browser();
+        state.replace_managed_windows(vec![42]);
+        assert!(!state.active_app_focused());
+        state.set_active_app_focused(true);
+        assert!(state.active_app_focused());
+        assert!(state.public(1080, 2340, Vec::new()).app_focused);
+
+        state.set_active_app_focused(false);
+        assert!(!state.active_app_focused());
+        state.set_active_app_focused(true);
+        state.home();
+        assert!(!state.active_app_focused());
+        state.lock();
+        assert!(!state.active_app_focused());
     }
 
     #[test]
@@ -532,7 +642,7 @@ mod tests {
             KeyboardEffect::Inject(crate::keyboard::KeyboardInput::Character('x'))
         ));
 
-        let public = serde_json::to_value(state.public(1080, 2340)).unwrap();
+        let public = serde_json::to_value(state.public(1080, 2340, Vec::new())).unwrap();
         assert_eq!(
             public.get("keyboard").unwrap(),
             &serde_json::json!({
@@ -554,7 +664,7 @@ mod tests {
         state.launch_system();
         assert_eq!(state.view, View::Locked);
         assert!(!state.keyboard.is_visible());
-        assert_eq!(state.public(1080, 2340).current_app, None);
+        assert_eq!(state.public(1080, 2340, Vec::new()).current_app, None);
         assert_eq!(state.last_action, "keyboard_show_blocked");
     }
 }

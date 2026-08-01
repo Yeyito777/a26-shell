@@ -16,7 +16,7 @@ pub(crate) const FG: u32 = 0xf5f7fb;
 pub(crate) const MUTED: u32 = 0x94a3b8;
 pub(crate) const ACCENT: u32 = 0x5eead4;
 pub(crate) const ACCENT_2: u32 = 0x60a5fa;
-const DANGER: u32 = 0xfb7185;
+pub(crate) const DANGER: u32 = 0xfb7185;
 const APP_ICON_SIZE: u16 = 220;
 const APP_ICON_BYTES: usize = APP_ICON_SIZE as usize * APP_ICON_SIZE as usize * 4;
 const SYSTEM_ICON_PATH: &str = "/opt/a26-system/share/system-app.bgrx";
@@ -143,7 +143,7 @@ impl Renderer {
     ) -> Result<(), Box<dyn Error>> {
         // Keep the identity and device status on one visual baseline. Moon is
         // deliberately quiet here so the applications remain the focus.
-        self.text(conn, "MOON", 64, 92, 6, FG)?;
+        self.text(conn, "MOON", 64, 34, 6, FG)?;
         self.render_device_status(conn, state)?;
 
         // A quiet one-pixel divider preserves the palette without turning the
@@ -152,9 +152,9 @@ impl Renderer {
             conn,
             BG_CARD,
             Rectangle {
-                x: 64,
-                y: 184,
-                width: self.width - 128,
+                x: 0,
+                y: 123,
+                width: self.width,
                 height: 1,
             },
         )?;
@@ -256,13 +256,13 @@ impl Renderer {
         state: &ShellState,
     ) -> Result<(), Box<dyn Error>> {
         let wifi_color = if state.wifi_connected { ACCENT } else { MUTED };
-        self.text(conn, "WIFI", 680, 102, 3, wifi_color)?;
+        self.text(conn, "WIFI", 680, 48, 3, wifi_color)?;
         self.fill(
             conn,
             if state.wifi_connected { ACCENT } else { DANGER },
             Rectangle {
                 x: 770,
-                y: 106,
+                y: 53,
                 width: 14,
                 height: 14,
             },
@@ -272,9 +272,9 @@ impl Renderer {
             BG_CARD,
             Rectangle {
                 x: 816,
-                y: 88,
+                y: 36,
                 width: 1,
-                height: 50,
+                height: 52,
             },
         )?;
 
@@ -285,7 +285,7 @@ impl Renderer {
             conn,
             &battery_text,
             battery_x - 18 - text_width as i16,
-            99,
+            43,
             4,
             FG,
         )?;
@@ -294,7 +294,7 @@ impl Renderer {
             MUTED,
             Rectangle {
                 x: battery_x,
-                y: 99,
+                y: 43,
                 width: 44,
                 height: 28,
             },
@@ -305,7 +305,7 @@ impl Renderer {
             MUTED,
             Rectangle {
                 x: battery_x + 44,
-                y: 107,
+                y: 51,
                 width: 8,
                 height: 12,
             },
@@ -318,11 +318,35 @@ impl Renderer {
                     if percent <= 20 { DANGER } else { ACCENT },
                     Rectangle {
                         x: battery_x + 4,
-                        y: 103,
+                        y: 47,
                         width: fill_width,
                         height: 20,
                     },
                 )?;
+            }
+        }
+        if state.battery_charging {
+            for rectangle in [
+                Rectangle {
+                    x: battery_x + 19,
+                    y: 46,
+                    width: 8,
+                    height: 9,
+                },
+                Rectangle {
+                    x: battery_x + 14,
+                    y: 54,
+                    width: 13,
+                    height: 7,
+                },
+                Rectangle {
+                    x: battery_x + 14,
+                    y: 60,
+                    width: 8,
+                    height: 9,
+                },
+            ] {
+                self.fill(conn, FG, rectangle)?;
             }
         }
         Ok(())

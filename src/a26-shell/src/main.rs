@@ -1,3 +1,4 @@
+mod apps;
 mod audio;
 mod config;
 mod font;
@@ -6,22 +7,24 @@ mod ipc;
 mod keyboard;
 mod model;
 mod status;
+mod status_bar;
 mod ui;
 mod volume;
 
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
-use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use apps::{AppRegistry, RegistryUpdate, WindowVisibility};
 use audio::AudioVolume;
 use config::Config;
 use input::{Backlight, PowerKey, TouchscreenPower, VolumeKey, VolumeKeys};
 use ipc::{Command, IpcServer};
 use keyboard::{KeyboardEffect, KeyboardGeometry, KeyboardSurface, XtestInjector};
-use model::{PointerGesture, ShellState, View};
+use model::{AppId, PointerGesture, ShellState, View};
+use status_bar::StatusBarSurface;
 use ui::{KeypadAction, Renderer};
 use volume::VolumeSurface;
 use x11rb::connection::Connection;
@@ -31,15 +34,13 @@ use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, Blanking, ChangeWindowAttributesAux,
     ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Exposures,
-    InputFocus, MOTION_NOTIFY_EVENT, PropMode, StackMode, WindowClass,
+    InputFocus, MOTION_NOTIFY_EVENT, NotifyDetail, PropMode, StackMode, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
-const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
-const DEFAULT_BROWSER_APP: &str = "/opt/vimbrowser-a26/bin/vimbrowser-a26";
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const MAX_REPEAT_CATCH_UP: usize = 8;
@@ -100,7 +101,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     conn.xfixes_query_version(4, 0)?.reply()?;
-    let mut key_injector = XtestInjector::query(
+    let key_injector = XtestInjector::query(
         &conn,
         root,
         conn.setup().min_keycode,
@@ -178,10 +179,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut keyboard_surface =
         KeyboardSurface::create(&conn, root, screen.root_depth, keyboard_geometry)?;
     let mut volume_surface = VolumeSurface::create(&conn, root, screen.root_depth)?;
+    let mut status_bar_surface = StatusBarSurface::create(&conn, root, screen.root_depth, width)?;
     conn.map_window(shell_window)?;
     conn.xfixes_hide_cursor(shell_window)?.check()?;
     conn.xfixes_hide_cursor(keyboard_surface.window)?.check()?;
     conn.xfixes_hide_cursor(volume_surface.window)?.check()?;
+    conn.xfixes_hide_cursor(status_bar_surface.window)?
+        .check()?;
     raise_shell(&conn, shell_window)?;
     conn.set_input_focus(InputFocus::PARENT, shell_window, CURRENT_TIME)?;
     conn.flush()?;
@@ -214,6 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .unwrap_or(config.initial_volume);
     let mut state = ShellState::new(config.start_locked, initial_volume);
+    let mut apps = AppRegistry::from_environment();
     if let Some(control) = audio_volume.as_ref()
         && let Err(error) = control.set(state.volume)
     {
@@ -222,6 +227,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let initial_status = status::DeviceStatus::read();
     state.update_device_status(
         initial_status.battery_percent,
+        initial_status.battery_charging,
         initial_status.wifi_connected,
     );
     let mut next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
@@ -262,9 +268,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut hardware_awake = true;
     let mut raw_touch = RawTouchTracker::default();
-    let mut system_app: Option<Child> = None;
-    let mut browser_app: Option<Child> = None;
     let mut app_viewport: Option<(u32, u16)> = None;
+    let mut shell_inset = false;
     renderer.render(&conn, &state)?;
     if let Some(device) = touchscreen.as_ref()
         && let Err(error) = device.on()
@@ -293,13 +298,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 shell_window,
                 keyboard_surface.window,
                 volume_surface.window,
+                status_bar_surface.window,
                 (width, height),
                 &keyboard_geometry,
                 &config,
                 &mut state,
+                &mut apps,
                 &mut raw_touch,
-                &mut key_injector,
+                &key_injector,
                 &mut volume_surface,
+                &mut status_bar_surface,
                 key_repeat_timing,
             )?;
         }
@@ -360,7 +368,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         audio_volume.as_ref(),
                         key_repeat_timing,
                     );
-                    let public = state.public(width, height);
+                    let public = state.public(width, height, apps.public());
                     ipc::respond(stream, Ok(&public));
                 }
                 Err(error) => ipc::respond::<model::PublicState>(stream, Err(&error)),
@@ -376,9 +384,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             key_repeat_timing,
         );
 
-        reconcile_apps(&mut state, &mut system_app, &mut browser_app);
+        let desired_app = AppId::from_view(state.view);
+        let update = apps.reconcile(desired_app);
+        apply_registry_update(
+            &conn,
+            shell_window,
+            width,
+            height,
+            &mut state,
+            &mut apps,
+            update,
+        )?;
+        let desired_shell_inset = state.view.is_app();
+        if desired_shell_inset != shell_inset {
+            resize_shell_window(&conn, shell_window, width, height, desired_shell_inset)?;
+            shell_inset = desired_shell_inset;
+        }
+        state.replace_managed_windows(apps.active_windows());
         if state.app_ready_to_reveal() {
-            let app_window = state.managed_windows.first().copied();
+            let app_window = apps.primary_active_window();
             state.finish_app_launch();
             if let Some(window) = app_window {
                 fullscreen_window(&conn, window, width, height)?;
@@ -404,6 +428,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if desired_viewport != app_viewport {
             if let Some((window, app_height)) = desired_viewport {
                 resize_app_window(&conn, window, width, app_height)?;
+                status_bar_surface.request_raise();
                 if state.keyboard.is_visible() {
                     state.keyboard.request_raise();
                 }
@@ -420,7 +445,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         volume_surface.sync(&conn, volume_visible, state.volume)?;
         if Instant::now() >= next_device_status {
             let device_status = status::DeviceStatus::read();
-            state.update_device_status(device_status.battery_percent, device_status.wifi_connected);
+            state.update_device_status(
+                device_status.battery_percent,
+                device_status.battery_charging,
+                device_status.wifi_connected,
+            );
             next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
         }
         if state.app_launching() && Instant::now() >= next_launch_animation {
@@ -464,9 +493,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !state.view.is_app() || state.app_launching() {
                 raise_shell(&conn, shell_window)?;
                 renderer.render(&conn, &state)?;
+                if state.app_launching() {
+                    status_bar_surface.request_raise();
+                }
             }
             state.redraw = false;
         }
+        // Present the status surface after the loading shell. Besides keeping
+        // the cutout strip out of the app viewport, this gives the bar the last
+        // stacking request on every animated launch frame and prevents the two
+        // override-redirect surfaces from alternately covering one another.
+        let status_bar_visible = state.screen_awake && state.view.is_app();
+        status_bar_surface.sync(
+            &conn,
+            status_bar_visible,
+            state.wifi_connected,
+            state.battery_percent,
+            state.battery_charging,
+        )?;
         // External-app MapRequest/configure operations may be the only X11
         // traffic in this state, so they cannot rely on a shell repaint to
         // flush the connection.
@@ -486,11 +530,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _ = device.on();
         }
     }
-    stop_system_app(&mut system_app);
-    stop_system_app(&mut browser_app);
+    apps.shutdown();
     let _ = conn.destroy_window(shell_window);
     keyboard_surface.destroy(&conn);
     volume_surface.destroy(&conn);
+    status_bar_surface.destroy(&conn);
     let _ = conn.free_pixmap(shell_back_buffer);
     let _ = conn.free_gc(gc);
     let _ = conn.flush();
@@ -524,13 +568,16 @@ fn handle_x_event(
     shell_window: u32,
     keyboard_window: u32,
     volume_window: u32,
+    status_bar_window: u32,
     dimensions: (u16, u16),
     keyboard_geometry: &KeyboardGeometry,
     config: &Config,
     state: &mut ShellState,
+    apps: &mut AppRegistry,
     raw_touch: &mut RawTouchTracker,
-    key_injector: &mut XtestInjector,
+    key_injector: &XtestInjector,
     volume_surface: &mut VolumeSurface,
+    status_bar_surface: &mut StatusBarSurface,
     key_repeat_timing: KeyRepeatTiming,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height) = dimensions;
@@ -626,6 +673,9 @@ fn handle_x_event(
         Event::Expose(event) if event.window == volume_window => {
             volume_surface.request_redraw();
         }
+        Event::Expose(event) if event.window == status_bar_window => {
+            status_bar_surface.request_redraw();
+        }
         Event::ButtonPress(event) if event.event == shell_window => {
             if state.pointer.is_none() && raw_touch.keyboard_contacts.is_empty() {
                 if let Some(action) = pointer_begin(
@@ -660,16 +710,42 @@ fn handle_x_event(
             if event.window != shell_window
                 && event.window != keyboard_window
                 && event.window != volume_window
+                && event.window != status_bar_window
             {
-                conn.map_window(event.window)?;
-                conn.xfixes_hide_cursor(event.window)?.check()?;
-                if !state.managed_windows.contains(&event.window) {
-                    state.managed_windows.push(event.window);
+                // A MapRequest is handled inside the current app lifecycle. Do
+                // not synchronously query WM_TRANSIENT_FOR on Moon's long-lived
+                // X connection: any runtime reply wait can hit the same wrapped
+                // sequence ambiguity that previously froze keyboard input.
+                // Known windows retain their owner; new primary/popup windows
+                // belong to the app that Moon deliberately launched or resumed.
+                let owner = apps.owner_of(event.window).or_else(|| apps.active());
+                let registration = owner.map(|owner| apps.register_window(owner, event.window));
+                let should_show = registration
+                    .as_ref()
+                    .is_none_or(|registration| registration.should_show);
+                if registration.is_some() {
+                    // Focus events on the managed top-level also report focus
+                    // entering/leaving its descendants. This preserves CEF's
+                    // exact page/textfield focus without a synchronous query.
+                    let _ = conn.change_window_attributes(
+                        event.window,
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::FOCUS_CHANGE),
+                    )?;
                 }
-                let is_primary = state.managed_windows.first().copied() == Some(event.window);
-                state.last_action = "map_external_window".into();
-                state.redraw = true;
-                if state.view.is_app() {
+                if should_show {
+                    conn.map_window(event.window)?;
+                    let _ = conn.xfixes_hide_cursor(event.window)?;
+                }
+                state.replace_managed_windows(apps.active_windows());
+                let is_active = registration
+                    .as_ref()
+                    .is_some_and(|registration| apps.active() == Some(registration.owner));
+                let is_primary = registration
+                    .as_ref()
+                    .is_some_and(|registration| registration.primary);
+                if is_active {
+                    state.last_action = "map_external_window".into();
+                    state.redraw = true;
                     let app_height = if is_primary && state.keyboard.is_visible() {
                         keyboard_geometry.app_height()
                     } else {
@@ -685,20 +761,22 @@ fn handle_x_event(
                         conn.set_input_focus(InputFocus::PARENT, event.window, CURRENT_TIME)?;
                     }
                     state.keyboard.request_raise();
+                    status_bar_surface.request_raise();
                 } else {
                     raise_shell(conn, shell_window)?;
                 }
             }
         }
         Event::ConfigureRequest(event) => {
-            if state.view.is_app() && state.managed_windows.contains(&event.window) {
-                let is_primary = state.managed_windows.first().copied() == Some(event.window);
+            if state.view.is_app() && apps.is_active_window(event.window) {
+                let is_primary = apps.primary_active_window() == Some(event.window);
                 if is_primary && state.keyboard.is_visible() {
                     resize_app_window(conn, event.window, width, keyboard_geometry.app_height())?;
                 } else {
                     fullscreen_window(conn, event.window, width, height)?;
                 }
                 state.keyboard.request_raise();
+                status_bar_surface.request_raise();
                 if state.app_launching() {
                     raise_shell(conn, shell_window)?;
                 }
@@ -710,6 +788,7 @@ fn handle_x_event(
                 // shell over the application's primary window.
                 if state.view.is_app() {
                     state.keyboard.request_raise();
+                    status_bar_surface.request_raise();
                 } else {
                     raise_shell(conn, shell_window)?;
                 }
@@ -718,33 +797,61 @@ fn handle_x_event(
         Event::MapNotify(event)
             if event.window != shell_window
                 && event.window != keyboard_window
-                && event.window != volume_window =>
+                && event.window != volume_window
+                && event.window != status_bar_window =>
         {
-            state.keyboard.request_raise();
-            volume_surface.request_redraw();
+            if apps.note_mapped(event.window) {
+                state.keyboard.request_raise();
+                volume_surface.request_redraw();
+                status_bar_surface.request_raise();
+            } else {
+                conn.unmap_window(event.window)?;
+                raise_shell(conn, shell_window)?;
+            }
         }
         Event::ConfigureNotify(event)
             if event.window != shell_window
                 && event.window != keyboard_window
-                && event.window != volume_window =>
+                && event.window != volume_window
+                && event.window != status_bar_window =>
         {
-            state.keyboard.request_raise();
-            volume_surface.request_redraw();
+            if apps
+                .owner_of(event.window)
+                .is_none_or(|owner| apps.active() == Some(owner))
+            {
+                state.keyboard.request_raise();
+                volume_surface.request_redraw();
+                status_bar_surface.request_raise();
+            }
         }
         Event::DestroyNotify(event) => {
-            if event.window != volume_window {
-                state.note_managed_window_closed(event.window);
+            if event.window != volume_window && event.window != status_bar_window {
+                apps.remove_window(event.window);
+                state.replace_managed_windows(apps.active_windows());
             }
         }
         Event::UnmapNotify(event) => {
-            if event.window != keyboard_window && event.window != volume_window {
-                state.note_managed_window_closed(event.window);
+            if event.window != keyboard_window
+                && event.window != volume_window
+                && event.window != status_bar_window
+            {
+                apps.note_unmapped(event.window);
+                state.replace_managed_windows(apps.active_windows());
             }
         }
+        Event::FocusIn(event) if apps.is_active_window(event.event) => {
+            state.set_active_app_focused(true);
+        }
+        Event::FocusOut(event)
+            if apps.is_active_window(event.event) && event.detail != NotifyDetail::INFERIOR =>
+        {
+            state.set_active_app_focused(false);
+        }
         Event::MappingNotify(_) => {
-            if let Err(error) = key_injector.refresh(conn) {
-                eprintln!("cannot refresh X keyboard mapping: {error}");
-            }
+            // The phone uses one fixed XKB map for the entire Xorg session.
+            // Avoid introducing a runtime round trip into the event loop. A
+            // mapping change takes effect after the next Moon session restart.
+            eprintln!("X keyboard mapping changed; refresh deferred until restart");
         }
         _ => {}
     }
@@ -783,13 +890,14 @@ fn fullscreen_window(
     width: u16,
     height: u16,
 ) -> Result<(), Box<dyn Error>> {
+    let content_height = app_content_height(height);
     conn.configure_window(
         window,
         &ConfigureWindowAux::new()
             .x(0)
-            .y(0)
+            .y(i32::from(status_bar::HEIGHT))
             .width(u32::from(width))
-            .height(u32::from(height))
+            .height(u32::from(content_height))
             .border_width(0)
             .stack_mode(StackMode::ABOVE),
     )?;
@@ -802,98 +910,89 @@ fn resize_app_window(
     width: u16,
     height: u16,
 ) -> Result<(), Box<dyn Error>> {
+    let content_height = app_content_height(height);
     conn.configure_window(
         window,
         &ConfigureWindowAux::new()
             .x(0)
-            .y(0)
+            .y(i32::from(status_bar::HEIGHT))
             .width(u32::from(width))
-            .height(u32::from(height.max(1)))
+            .height(u32::from(content_height))
             .border_width(0),
     )?;
     Ok(())
 }
 
-fn reconcile_apps(
-    state: &mut ShellState,
-    system_child: &mut Option<Child>,
-    browser_child: &mut Option<Child>,
-) {
-    match state.view {
-        View::System => {
-            stop_system_app(browser_child);
-            let executable = env::var_os("A26_SYSTEM_APP")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| DEFAULT_SYSTEM_APP.into());
-            reconcile_app(state, system_child, &executable, "System");
-        }
-        View::Browser => {
-            stop_system_app(system_child);
-            let executable = env::var_os("A26_BROWSER_APP")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| DEFAULT_BROWSER_APP.into());
-            reconcile_app(state, browser_child, &executable, "Browser");
-        }
-        View::Locked | View::Launcher => {
-            stop_system_app(system_child);
-            stop_system_app(browser_child);
-        }
-    }
+fn app_content_height(bottom: u16) -> u16 {
+    bottom.saturating_sub(status_bar::HEIGHT).max(1)
 }
 
-fn reconcile_app(
+fn resize_shell_window<C: Connection>(
+    conn: &C,
+    window: u32,
+    width: u16,
+    height: u16,
+    inset: bool,
+) -> Result<(), Box<dyn Error>> {
+    let (top, content_height) = shell_geometry(height, inset);
+    conn.configure_window(
+        window,
+        &ConfigureWindowAux::new()
+            .x(0)
+            .y(i32::from(top))
+            .width(u32::from(width))
+            .height(u32::from(content_height))
+            .border_width(0),
+    )?;
+    Ok(())
+}
+
+fn shell_geometry(height: u16, inset: bool) -> (u16, u16) {
+    let top = if inset { status_bar::HEIGHT } else { 0 };
+    (top, height.saturating_sub(top).max(1))
+}
+
+fn apply_registry_update(
+    conn: &RustConnection,
+    shell_window: u32,
+    width: u16,
+    height: u16,
     state: &mut ShellState,
-    child: &mut Option<Child>,
-    executable: &PathBuf,
-    name: &str,
-) {
-    if let Some(process) = child.as_mut() {
-        match process.try_wait() {
-            Ok(Some(status)) => {
-                eprintln!("{name} exited with {status}");
-                *child = None;
-                state.home();
-                state.last_action = format!("{}_process_exited", name.to_ascii_lowercase());
+    apps: &mut AppRegistry,
+    update: RegistryUpdate,
+) -> Result<(), Box<dyn Error>> {
+    for action in update.visibility {
+        match action {
+            WindowVisibility::Show(window) => {
+                conn.map_window(window)?;
             }
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("cannot inspect {name}: {error}");
-                stop_system_app(child);
-                state.home();
-                state.last_action = format!("{}_process_error", name.to_ascii_lowercase());
+            WindowVisibility::Hide(window) => {
+                conn.unmap_window(window)?;
             }
         }
     }
 
-    if !state.view.is_app() || child.is_some() {
-        return;
-    }
-    match ProcessCommand::new(executable)
-        .env(
-            "DISPLAY",
-            env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
-        )
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(process) => {
-            eprintln!("started {name} pid={}", process.id());
-            *child = Some(process);
-            state.last_action = format!("{}_process_started", name.to_ascii_lowercase());
-        }
-        Err(error) => {
-            eprintln!("cannot start {}: {error}", executable.display());
-            state.home();
-            state.last_action = format!("{}_launch_failed", name.to_ascii_lowercase());
+    if let Some(app) = update.active_process_exited {
+        state.home();
+        state.last_action = format!("{}_process_exited", app.display_name().to_ascii_lowercase());
+        raise_shell(conn, shell_window)?;
+    } else if let Some(app) = update.active_process_failed {
+        state.home();
+        state.last_action = format!("{}_process_error", app.display_name().to_ascii_lowercase());
+        raise_shell(conn, shell_window)?;
+    } else if let Some(app) = update.resumed {
+        state.note_app_resumed(app);
+        if let Some(window) = apps.primary_active_window() {
+            fullscreen_window(conn, window, width, height)?;
+            conn.set_input_focus(InputFocus::PARENT, window, CURRENT_TIME)?;
         }
     }
-}
 
-fn stop_system_app(child: &mut Option<Child>) {
-    if let Some(mut process) = child.take() {
-        let _ = process.kill();
-        let _ = process.wait();
+    if apps.active().is_none() {
+        state.set_active_app_focused(false);
+        raise_shell(conn, shell_window)?;
     }
+    Ok(())
 }
 
 fn pointer_begin(
@@ -1136,7 +1235,15 @@ fn repeat_keyboard_if_due(
             .first()
             .copied()
             .ok_or_else(|| "active app window is unavailable".into())
-            .and_then(|primary| key_injector.inject_repeats(conn, input, primary, repeat_count));
+            .and_then(|primary| {
+                key_injector.inject_repeats(
+                    conn,
+                    input,
+                    primary,
+                    state.active_app_focused(),
+                    repeat_count,
+                )
+            });
         if let Err(error) = result {
             // Never include repeated character/key identity in diagnostics.
             eprintln!("keyboard repeat injection failed: {error}");
@@ -1261,7 +1368,7 @@ fn pointer_end(
         && elapsed <= Duration::from_millis(1400);
     if close_swipe {
         state.home();
-        state.last_action = "swipe_up_close".into();
+        state.last_action = "swipe_up_background".into();
         return;
     }
     if dx.abs() <= 35 && dy.abs() <= 35 && elapsed <= Duration::from_millis(650) {
@@ -1400,7 +1507,7 @@ fn inject_keyboard_input(
         .first()
         .copied()
         .ok_or_else(|| "active app window is unavailable".into())
-        .and_then(|primary| key_injector.inject(conn, input, primary));
+        .and_then(|primary| key_injector.inject(conn, input, primary, state.active_app_focused()));
     if let Err(error) = result {
         // Never include the character or key action in this diagnostic;
         // password input is intentionally ephemeral and non-loggable.
@@ -1473,7 +1580,7 @@ fn apply_command(
         Command::SwipeUp => {
             if state.view.is_app() {
                 state.home();
-                state.last_action = "swipe_up_close".into();
+                state.last_action = "swipe_up_background".into();
             }
         }
         Command::VolumeUp => change_volume(state, audio_volume, 5),
@@ -1511,11 +1618,9 @@ fn forward_tap(conn: &RustConnection, root: u32, x: i16, y: i16) -> Result<(), B
     // establish page focus. XTEST performs normal server hit-testing at the
     // physical coordinate, so native app controls and embedded page surfaces
     // receive the same pointer sequence as a hardware tap.
-    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, CURRENT_TIME, root, x, y, 0)?
-        .check()?;
+    let _ = conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, CURRENT_TIME, root, x, y, 0)?;
     for response_type in [BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT] {
-        conn.xtest_fake_input(response_type, 1, CURRENT_TIME, root, 0, 0, 0)?
-            .check()?;
+        let _ = conn.xtest_fake_input(response_type, 1, CURRENT_TIME, root, 0, 0, 0)?;
     }
     conn.flush()?;
     Ok(())
@@ -1530,6 +1635,15 @@ mod touch_tests {
             integral: value,
             frac: 0,
         }
+    }
+
+    #[test]
+    fn app_layout_reserves_one_top_status_inset() {
+        assert_eq!(app_content_height(2340), 2216);
+        assert_eq!(app_content_height(1520), 1396);
+        assert_eq!(app_content_height(0), 1);
+        assert_eq!(shell_geometry(2340, true), (124, 2216));
+        assert_eq!(shell_geometry(2340, false), (0, 2340));
     }
 
     #[test]

@@ -3,9 +3,9 @@ use std::error::Error;
 use serde::Serialize;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ChangeGCAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
-    EventMask, Gcontext, InputFocus, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode, Keysym, PropMode,
-    Rectangle, StackMode, Window, WindowClass,
+    ChangeGCAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
+    Gcontext, InputFocus, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, Keycode, Keysym, PropMode, Rectangle,
+    StackMode, Window, WindowClass,
 };
 use x11rb::protocol::xtest::{self, ConnectionExt as _};
 use x11rb::wrapper::ConnectionExt as _;
@@ -32,8 +32,6 @@ const XK_SHIFT_L: Keysym = 0xffe1;
 const XK_SHIFT_R: Keysym = 0xffe2;
 const XK_MODE_SWITCH: Keysym = 0xff7e;
 const XK_ISO_LEVEL3_SHIFT: Keysym = 0xfe03;
-const KEY_RELEASE_DELAY_MS: u32 = 12;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyboardPurpose {
@@ -916,8 +914,6 @@ impl KeyboardSurface {
 pub struct XtestInjector {
     root: Window,
     mapping: Option<ServerKeyboardMapping>,
-    min_keycode: Keycode,
-    max_keycode: Keycode,
 }
 
 impl XtestInjector {
@@ -945,23 +941,7 @@ impl XtestInjector {
             eprintln!("XTEST unavailable; on-screen keyboard input is disabled");
             None
         };
-        Ok(Self {
-            root,
-            mapping,
-            min_keycode,
-            max_keycode,
-        })
-    }
-
-    pub fn refresh<C: Connection>(&mut self, conn: &C) -> Result<(), Box<dyn Error>> {
-        if self.mapping.is_some() {
-            self.mapping = Some(ServerKeyboardMapping::query(
-                conn,
-                self.min_keycode,
-                self.max_keycode,
-            )?);
-        }
-        Ok(())
+        Ok(Self { root, mapping })
     }
 
     pub fn inject<C: Connection>(
@@ -969,12 +949,25 @@ impl XtestInjector {
         conn: &C,
         input: KeyboardInput,
         primary_app: Window,
+        focus_within_active_app: bool,
     ) -> Result<(), Box<dyn Error>> {
         let mapping = self.mapping.as_ref().ok_or("XTEST is unavailable")?;
-        let focus = conn.get_input_focus()?.reply()?.focus;
-        if !self.focus_belongs_to_app(conn, focus, primary_app)? {
-            return Err("X focus does not belong to the active app".into());
+        if primary_app == 0 || !focus_within_active_app {
+            return Err("X focus is outside the active app".into());
         }
+        // Never perform a synchronous X11 round trip from the input event loop.
+        // Moon's long-lived rendering connection can issue more than one 16-bit
+        // X11 sequence epoch of unchecked drawing/XTEST requests. A later
+        // synchronous focus query can then wait forever if the wrapped reply is
+        // associated with the wrong epoch. That exact wait previously froze the
+        // entire shell while a user was typing.
+        //
+        // Focus provenance is maintained from FocusIn/FocusOut events selected
+        // on Moon's managed app windows. Never move focus here: CEF descendants
+        // and application transients must retain their exact editable target.
+        // Queue the complete sequence without checked cookies. Any protocol error
+        // remains asynchronous and is handled by the ordinary X event loop; input
+        // can no longer block shell IPC, touch, power, or volume handling.
         let keysym = match input {
             KeyboardInput::Character(character) if character.is_ascii() => character as Keysym,
             KeyboardInput::Character(_) => {
@@ -1000,32 +993,15 @@ impl XtestInjector {
         }
 
         let modifiers: Vec<Keycode> = modifiers.into_iter().flatten().collect();
-        let mut pressed_modifiers = Vec::with_capacity(modifiers.len());
         for keycode in modifiers.iter().copied() {
-            if let Err(error) = self.fake_key(conn, KEY_PRESS_EVENT, keycode) {
-                self.release_modifiers_best_effort(conn, &pressed_modifiers);
-                return Err(error);
-            }
-            pressed_modifiers.push(keycode);
+            self.fake_key_unchecked(conn, KEY_PRESS_EVENT, keycode)?;
         }
-        if let Err(error) = self.fake_key(conn, KEY_PRESS_EVENT, resolved.keycode) {
-            self.release_modifiers_best_effort(conn, &pressed_modifiers);
-            return Err(error);
-        }
-        let key_release = self.fake_key(conn, KEY_RELEASE_EVENT, resolved.keycode);
-        let mut modifier_release_error = None;
-        for keycode in pressed_modifiers.iter().copied().rev() {
-            if let Err(error) = self.fake_key(conn, KEY_RELEASE_EVENT, keycode)
-                && modifier_release_error.is_none()
-            {
-                modifier_release_error = Some(error);
-            }
+        self.fake_key_unchecked(conn, KEY_PRESS_EVENT, resolved.keycode)?;
+        self.fake_key_unchecked(conn, KEY_RELEASE_EVENT, resolved.keycode)?;
+        for keycode in modifiers.iter().copied().rev() {
+            self.fake_key_unchecked(conn, KEY_RELEASE_EVENT, keycode)?;
         }
         conn.flush()?;
-        key_release?;
-        if let Some(error) = modifier_release_error {
-            return Err(error);
-        }
         Ok(())
     }
 
@@ -1038,15 +1014,15 @@ impl XtestInjector {
         conn: &C,
         input: KeyboardInput,
         primary_app: Window,
+        focus_within_active_app: bool,
         count: usize,
     ) -> Result<(), Box<dyn Error>> {
         if count == 0 {
             return Ok(());
         }
         let mapping = self.mapping.as_ref().ok_or("XTEST is unavailable")?;
-        let focus = conn.get_input_focus()?.reply()?.focus;
-        if !self.focus_belongs_to_app(conn, focus, primary_app)? {
-            return Err("X focus does not belong to the active app".into());
+        if primary_app == 0 || !focus_within_active_app {
+            return Err("X focus is outside the active app".into());
         }
         let keysym = match input {
             KeyboardInput::Character(character) if character.is_ascii() => character as Keysym,
@@ -1083,68 +1059,6 @@ impl XtestInjector {
             }
         }
         conn.flush()?;
-        Ok(())
-    }
-
-    fn focus_belongs_to_app<C: Connection>(
-        &self,
-        conn: &C,
-        focus: Window,
-        primary_app: Window,
-    ) -> Result<bool, Box<dyn Error>> {
-        if focus == 0 || focus == 1 || primary_app == 0 {
-            return Ok(false);
-        }
-        let mut current = focus;
-        for _ in 0..64 {
-            if current == primary_app {
-                return Ok(true);
-            }
-            let transient = conn
-                .get_property(
-                    false,
-                    current,
-                    AtomEnum::WM_TRANSIENT_FOR,
-                    AtomEnum::WINDOW,
-                    0,
-                    1,
-                )?
-                .reply()?;
-            if transient.value32().and_then(|mut values| values.next()) == Some(primary_app) {
-                return Ok(true);
-            }
-            let tree = conn.query_tree(current)?.reply()?;
-            if tree.parent == primary_app {
-                return Ok(true);
-            }
-            if tree.parent == 0 || tree.parent == self.root || tree.parent == current {
-                return Ok(false);
-            }
-            current = tree.parent;
-        }
-        Ok(false)
-    }
-
-    fn release_modifiers_best_effort<C: Connection>(&self, conn: &C, modifiers: &[Keycode]) {
-        for keycode in modifiers.iter().copied().rev() {
-            let _ = self.fake_key(conn, KEY_RELEASE_EVENT, keycode);
-        }
-        let _ = conn.flush();
-    }
-
-    fn fake_key<C: Connection>(
-        &self,
-        conn: &C,
-        event_type: u8,
-        keycode: Keycode,
-    ) -> Result<(), Box<dyn Error>> {
-        let delay = if event_type == KEY_RELEASE_EVENT {
-            KEY_RELEASE_DELAY_MS
-        } else {
-            CURRENT_TIME
-        };
-        conn.xtest_fake_input(event_type, keycode, delay, self.root, 0, 0, 0)?
-            .check()?;
         Ok(())
     }
 
