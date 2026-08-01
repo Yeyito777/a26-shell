@@ -412,6 +412,15 @@ impl AppRegistry {
         Ok(())
     }
 
+    pub fn renew_browser_media_activity(&mut self, now: Instant) {
+        if self.app(AppId::Browser).lifecycle != AppLifecycle::Stopped {
+            // The AudioTrack bridge emits no page data, only a recent marker
+            // while Vimbrowser's PCM contains audible samples. Renewal remains
+            // subject to the same five-second bounded media lease as IPC.
+            let _ = self.acquire_lease(AppId::Browser, LeaseKind::Media, 5, now);
+        }
+    }
+
     fn app(&self, id: AppId) -> &Application {
         &self.applications[id.index()]
     }
@@ -484,5 +493,22 @@ mod tests {
             registry.app(AppId::System).lifecycle,
             AppLifecycle::Launching
         );
+    }
+
+    #[test]
+    fn audio_activity_renews_only_a_running_browser_media_lease() {
+        let mut registry = registry();
+        let now = Instant::now();
+        registry.renew_browser_media_activity(now);
+        assert!(registry.leases.public(AppId::Browser, now).is_empty());
+
+        registry.app_mut(AppId::Browser).lifecycle = AppLifecycle::Foreground;
+        registry.app_mut(AppId::Browser).child =
+            Some(Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap());
+        registry.renew_browser_media_activity(now);
+        let public = registry.leases.public(AppId::Browser, now);
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].kind, LeaseKind::Media);
+        registry.shutdown();
     }
 }

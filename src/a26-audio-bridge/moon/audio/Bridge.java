@@ -4,6 +4,7 @@ import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Looper;
 import android.os.Process;
+import android.os.SystemClock;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -26,6 +27,7 @@ public final class Bridge {
     private static final int CHANNELS = AudioFormat.CHANNEL_OUT_STEREO;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
     private static final int FRAME_BYTES = 4;
+    private static final long HEARTBEAT_INTERVAL_MS = 500;
 
     private Bridge() {}
 
@@ -95,14 +97,32 @@ public final class Bridge {
         }
     }
 
+    private static boolean containsAudibleSample(byte[] buffer, int length) {
+        for (int offset = 0; offset + 1 < length; offset += 2) {
+            int sample = (buffer[offset] & 0xff) | (buffer[offset + 1] << 8);
+            if (sample > 16 || sample < -16) return true;
+        }
+        return false;
+    }
+
+    private static void markMediaActive(File heartbeat) {
+        try (FileOutputStream output = new FileOutputStream(heartbeat, false)) {
+            output.write("active\n".getBytes(StandardCharsets.US_ASCII));
+        } catch (IOException ignored) {
+            // Audio must keep playing even if lifecycle telemetry is unavailable.
+        }
+    }
+
     public static void main(String[] args) throws Exception {
-        if (args.length != 3) {
-            System.err.println("usage: Bridge PCM_FIFO VOLUME_FILE PID_FILE");
+        if (args.length != 4) {
+            System.err.println("usage: Bridge PCM_FIFO VOLUME_FILE PID_FILE MEDIA_HEARTBEAT");
             System.exit(2);
         }
         String pcmPath = args[0];
         String volumePath = args[1];
         File pidFile = new File(args[2]);
+        File mediaHeartbeat = new File(args[3]);
+        mediaHeartbeat.delete();
 
         int minimum = AudioTrack.getMinBufferSize(RATE, CHANNELS, ENCODING);
         if (minimum <= 0) throw new IOException("AudioTrack buffer query failed: " + minimum);
@@ -123,6 +143,7 @@ public final class Bridge {
             while (true) {
                 int carried = 0;
                 boolean playing = false;
+                long lastHeartbeat = 0;
                 try (FileInputStream input = new FileInputStream(new File(pcmPath))) {
                     int count;
                     while ((count = input.read(buffer, carried, buffer.length - carried)) >= 0) {
@@ -139,6 +160,12 @@ public final class Bridge {
                         if (!playing) {
                             track.play();
                             playing = true;
+                        }
+                        long now = SystemClock.elapsedRealtime();
+                        if (containsAudibleSample(buffer, aligned)
+                                && now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+                            markMediaActive(mediaHeartbeat);
+                            lastHeartbeat = now;
                         }
                         int offset = 0;
                         while (offset < aligned) {
@@ -157,6 +184,7 @@ public final class Bridge {
                     track.pause();
                     track.flush();
                 }
+                mediaHeartbeat.delete();
             }
         } finally {
             try {
@@ -166,6 +194,7 @@ public final class Bridge {
             }
             track.release();
             removeOwnPid(pidFile);
+            mediaHeartbeat.delete();
         }
     }
 }

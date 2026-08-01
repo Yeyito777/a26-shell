@@ -9,6 +9,7 @@ RUNTIME=/data/local/tmp/moon-audio
 JAR="$BASE/moon-audio-bridge.jar"
 LOG="$BASE/bridge.log"
 PIDFILE="$RUNTIME/bridge.pid"
+MEDIA_HEARTBEAT="$RUNTIME/browser-media-active"
 
 valid_bridge_pid() {
     pid="$(cat "$PIDFILE" 2>/dev/null || true)"
@@ -21,7 +22,7 @@ if valid_bridge_pid && kill -0 "$pid" 2>/dev/null; then
     echo "moon audio bridge already running pid=$pid"
     exit 0
 fi
-rm -f "$PIDFILE"
+rm -f "$PIDFILE" "$MEDIA_HEARTBEAT"
 
 [ -x "$BB" ] || { echo "Moon BusyBox is unavailable" >&2; exit 20; }
 [ -r "$JAR" ] || { echo "Moon audio bridge is unavailable" >&2; exit 21; }
@@ -63,7 +64,7 @@ chown 1000:1000 "$LOG"
 chmod 0640 "$LOG"
 
 "$BB" nohup "$BB" setsid /debug_ramdisk/magisk su 1000 -c \
-    "CLASSPATH=$JAR app_process /system/bin moon.audio.Bridge $RUNTIME/pcm $RUNTIME/volume $PIDFILE" \
+    "CLASSPATH=$JAR app_process /system/bin moon.audio.Bridge $RUNTIME/pcm $RUNTIME/volume $PIDFILE $MEDIA_HEARTBEAT" \
     >>"$LOG" 2>&1 </dev/null &
 launcher=$!
 

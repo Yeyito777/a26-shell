@@ -32,5 +32,5 @@ if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] &&
     kill -KILL "$pid" 2>/dev/null || true
 fi
 
-rm -f "$PIDFILE" "$RUNTIME/pcm"
+rm -f "$PIDFILE" "$RUNTIME/pcm" "$RUNTIME/browser-media-active"
 echo 'moon audio bridge stopped'

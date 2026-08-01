@@ -15,6 +15,7 @@ mod volume;
 
 use std::env;
 use std::error::Error;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,6 +45,8 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
 const DEVICE_STATUS_INTERVAL: Duration = Duration::from_secs(5);
+const MEDIA_ACTIVITY_INTERVAL: Duration = Duration::from_millis(250);
+const MEDIA_ACTIVITY_MAX_AGE: Duration = Duration::from_secs(2);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const MAX_REPEAT_CATCH_UP: usize = 8;
 const STALE_POINTER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -233,6 +236,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         initial_status.wifi_connected,
     );
     let mut next_device_status = Instant::now() + DEVICE_STATUS_INTERVAL;
+    let mut next_media_activity = Instant::now();
     let mut next_launch_animation = Instant::now();
     let mut power_key = match PowerKey::open("/dev/input/event1") {
         Ok(device) => {
@@ -398,6 +402,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             &key_injector,
             key_repeat_timing,
         );
+
+        let now = Instant::now();
+        if now >= next_media_activity {
+            if heartbeat_is_recent(
+                Path::new("/run/moon-audio/browser-media-active"),
+                MEDIA_ACTIVITY_MAX_AGE,
+            ) {
+                apps.renew_browser_media_activity(now);
+            }
+            next_media_activity = now + MEDIA_ACTIVITY_INTERVAL;
+        }
 
         let desired_app = AppId::from_view(state.view);
         let update = apps.reconcile(desired_app);
@@ -573,6 +588,19 @@ fn parse_config_path() -> Result<PathBuf, Box<dyn Error>> {
         }
     }
     Ok(config)
+}
+
+fn heartbeat_is_recent(path: &Path, maximum_age: Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= maximum_age,
+        // A small wall-clock correction into the future must not interrupt an
+        // already-playing stream; the bounded lease still expires without new
+        // writes.
+        Err(_) => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1675,6 +1703,16 @@ mod touch_tests {
         assert_eq!(app_content_height(0), 1);
         assert_eq!(shell_geometry(2340, true), (124, 2216));
         assert_eq!(shell_geometry(2340, false), (0, 2340));
+    }
+
+    #[test]
+    fn media_heartbeat_requires_a_recent_existing_file() {
+        let path = env::temp_dir().join(format!("moon-media-heartbeat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!heartbeat_is_recent(&path, Duration::from_secs(2)));
+        std::fs::write(&path, b"active\n").unwrap();
+        assert!(heartbeat_is_recent(&path, Duration::from_secs(2)));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
