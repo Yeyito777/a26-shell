@@ -42,9 +42,12 @@ to the launcher without terminating its process. Reopening the app remaps the
 same windows and preserves its PID and in-memory state. Before exec, Moon places
 each app leader in `/dev/freezer/moon/<app>`; all later Chromium/helper children
 therefore inherit the same isolated process-tree cgroup without a post-spawn
-race. The next lifecycle milestone uses those groups to suspend background CPU
-use. Moon still terminates all registered children during an intentional shell
-shutdown so an upgrade cannot leave unsupervised processes behind.
+race. After Xorg receives the app's unmap requests, Moon freezes its group;
+reopening first thaws the complete process tree and then remaps the same window.
+This preserves in-memory state and the original PID while reducing ordinary
+background CPU use to zero. Moon still terminates all registered children during
+an intentional shell shutdown so an upgrade cannot leave unsupervised processes
+behind.
 
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by

@@ -962,6 +962,7 @@ fn apply_registry_update(
     apps: &mut AppRegistry,
     update: RegistryUpdate,
 ) -> Result<(), Box<dyn Error>> {
+    let freeze_after_hide = update.freeze_after_hide.clone();
     for action in update.visibility {
         match action {
             WindowVisibility::Show(window) => {
@@ -969,6 +970,20 @@ fn apply_registry_update(
             }
             WindowVisibility::Hide(window) => {
                 conn.unmap_window(window)?;
+            }
+        }
+    }
+
+    if !freeze_after_hide.is_empty() {
+        // Submit every unmap before suspending the client process. Xorg can
+        // then finish the visual transition without waiting on a frozen app.
+        conn.flush()?;
+        for app in freeze_after_hide {
+            if let Err(error) = apps.freeze_background(app) {
+                eprintln!(
+                    "cannot freeze {} in background: {error}",
+                    app.display_name()
+                );
             }
         }
     }

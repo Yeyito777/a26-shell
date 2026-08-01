@@ -17,6 +17,7 @@ pub enum WindowVisibility {
 #[derive(Debug, Default)]
 pub struct RegistryUpdate {
     pub visibility: Vec<WindowVisibility>,
+    pub freeze_after_hide: Vec<AppId>,
     pub resumed: Option<AppId>,
     pub active_process_exited: Option<AppId>,
     pub active_process_failed: Option<AppId>,
@@ -66,6 +67,12 @@ impl Application {
     }
 
     fn stop(&mut self) {
+        if let Err(error) = self.freezer.thaw() {
+            eprintln!(
+                "cannot thaw {} while stopping: {error}",
+                self.id.display_name()
+            );
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -246,6 +253,7 @@ impl AppRegistry {
                             update.visibility.push(WindowVisibility::Hide(window.id));
                         }
                     }
+                    update.freeze_after_hide.push(previous);
                 }
             }
             self.active = desired;
@@ -263,6 +271,13 @@ impl AppRegistry {
                 application.lifecycle = AppLifecycle::Launching;
             }
             AppLifecycle::Background => {
+                if let Err(error) = application.freezer.thaw() {
+                    eprintln!("cannot resume {}: {error}", application.id.display_name());
+                    application.stop();
+                    update.active_process_failed = Some(active);
+                    self.active = None;
+                    return update;
+                }
                 application.lifecycle = AppLifecycle::Foreground;
                 for window in &mut application.windows {
                     if !window.visible {
@@ -319,6 +334,14 @@ impl AppRegistry {
         self.active = None;
     }
 
+    pub fn freeze_background(&mut self, id: AppId) -> std::io::Result<()> {
+        let application = self.app_mut(id);
+        if application.lifecycle == AppLifecycle::Background {
+            application.freezer.freeze()?;
+        }
+        Ok(())
+    }
+
     fn app(&self, id: AppId) -> &Application {
         &self.applications[id.index()]
     }
@@ -354,6 +377,7 @@ mod tests {
 
         let update = registry.reconcile(None);
         assert_eq!(update.visibility, vec![WindowVisibility::Hide(11)]);
+        assert_eq!(update.freeze_after_hide, vec![AppId::System]);
         assert_eq!(
             registry.app(AppId::System).lifecycle,
             AppLifecycle::Background

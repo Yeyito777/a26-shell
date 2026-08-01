@@ -105,6 +105,20 @@ impl FreezerGroup {
         self.assigned = false;
     }
 
+    pub fn freeze(&self) -> io::Result<()> {
+        if self.assigned {
+            self.set_state("FROZEN")?;
+        }
+        Ok(())
+    }
+
+    pub fn thaw(&self) -> io::Result<()> {
+        if self.assigned {
+            self.set_state("THAWED")?;
+        }
+        Ok(())
+    }
+
     pub fn public_path(&self) -> Option<String> {
         self.assigned.then(|| self.public_path.clone()).flatten()
     }

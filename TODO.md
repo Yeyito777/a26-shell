@@ -1,7 +1,7 @@
 1. [x] Replace per-app child slots with a lifecycle-aware application registry.
 2. [x] Make swipe-up hide and background apps instead of terminating them.
 3. [x] Assign each app process tree to an isolated freezer cgroup.
-4. Unfreeze and remap background apps for instant reopening.
+4. [x] Unfreeze and remap background apps for instant reopening.
 5. Add bounded background-execution leases for media and transfers.
 6. Connect Vimbrowser media playback state to Moon’s lease protocol.
 7. Add memory-pressure eviction of least-recently-used background apps.

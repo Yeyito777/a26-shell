@@ -78,8 +78,16 @@ background_pid="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-syste
 [[ "$background_pid" == "$app_pid" ]]
 background_window="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -name a26-system 2>/dev/null || true'\''"' | tr -d '\r')"
 grep -q 'Map State: IsUnMapped' <<<"$background_window"
+for _ in $(seq 1 50); do
+    freezer_state="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/freezer.state"' | tr -d '\r')"
+    [[ "$freezer_state" == FROZEN ]] && break
+    sleep 0.1
+done
+[[ "$freezer_state" == FROZEN ]]
+state="$($CTL state)"
+python3 -c 'import json,sys; app=next(a for a in json.load(sys.stdin)["result"]["apps"] if a["app"] == "system"); assert app["lifecycle"] == "background"; assert app["freezer_state"] == "frozen"' <<<"$state"
 
-# Reopening resumes the same process and remaps its existing window.
+# Reopening thaws first, then resumes the same process and remaps its window.
 "$CTL" launch system >/dev/null
 for _ in $(seq 1 50); do
     resumed_window="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "A26_ROOT=/data/local/a26-linux A26_BUSYBOX=/data/local/a26-linux/busybox.static /system/bin/sh /data/local/a26-linux/a26-enter-chroot.sh /bin/sh -lc '\''DISPLAY=:0 xwininfo -name a26-system 2>/dev/null || true'\''"' | tr -d '\r')"
@@ -88,12 +96,19 @@ for _ in $(seq 1 50); do
 done
 [[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "pidof a26-system 2>/dev/null || true"' | tr -d '\r')" == "$background_pid" ]]
 grep -q 'Map State: IsViewable' <<<"$resumed_window"
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/freezer.state"' | tr -d '\r')" == THAWED ]]
 "$CTL" swipe-up >/dev/null
 
 before="$(field volume <<<"$state")"
-"$CTL" volume up >/dev/null
+if [[ "$before" -ge 100 ]]; then
+    "$CTL" volume down >/dev/null
+    expected=$((before - 5))
+else
+    "$CTL" volume up >/dev/null
+    expected=$((before + 5))
+fi
 after="$(field volume <<<"$($CTL state)")"
-[[ "$after" -eq $((before + 5)) ]]
+[[ "$after" -eq "$expected" ]]
 
 # Power policy locks before blanking and wakes only to the lock screen.
 "$CTL" screen off >/dev/null
