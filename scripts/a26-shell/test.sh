@@ -61,6 +61,12 @@ for _ in $(seq 1 50); do
 done
 [[ "$external_ready" == 1 ]]
 
+# The process enters its freezer group before exec, so every child it creates
+# inherits the same group without a post-spawn race.
+grep -q '^6:freezer:/moon/system$' < <(adb -s "$SERIAL" shell "/data/local/tmp/su -c 'grep freezer /proc/$app_pid/cgroup'" | tr -d '\r')
+state="$($CTL state)"
+python3 -c 'import json,sys; app=next(a for a in json.load(sys.stdin)["result"]["apps"] if a["app"] == "system"); assert app["freezer_cgroup"] == "/moon/system"; assert app["freezer_state"] == "thawed"' <<<"$state"
+
 # Reproduce the physical bottom-edge gesture through the same reducer path.
 "$CTL" pointer-begin 540 2290 >/dev/null
 "$CTL" pointer-move 540 1810 >/dev/null

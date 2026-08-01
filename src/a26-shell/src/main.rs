@@ -2,6 +2,7 @@ mod apps;
 mod audio;
 mod config;
 mod font;
+mod freezer;
 mod input;
 mod ipc;
 mod keyboard;

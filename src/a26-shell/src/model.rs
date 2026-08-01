@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use crate::config::Config;
+use crate::freezer::FreezerState;
 use crate::keyboard::{
     KeyAction, KeyboardEffect, KeyboardPurpose, KeyboardState, PublicKeyboardState,
 };
@@ -46,6 +47,13 @@ impl AppId {
             Self::Browser => 1,
         }
     }
+
+    pub fn cgroup_name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Browser => "browser",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -63,6 +71,8 @@ pub struct PublicAppState {
     pub lifecycle: AppLifecycle,
     pub pid: Option<u32>,
     pub windows: Vec<u32>,
+    pub freezer_cgroup: Option<String>,
+    pub freezer_state: FreezerState,
 }
 
 impl View {

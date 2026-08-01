@@ -39,9 +39,11 @@ tile and process lifecycle.
 Moon keeps a lifecycle-aware registry for each app (`stopped`, `launching`,
 `foreground`, or `background`). Swiping up unmaps the app's windows and returns
 to the launcher without terminating its process. Reopening the app remaps the
-same windows and preserves its PID and in-memory state. The later freezer-cgroup
-milestone will suspend CPU use while an app remains in this background state.
-Moon still terminates all registered children during an intentional shell
+same windows and preserves its PID and in-memory state. Before exec, Moon places
+each app leader in `/dev/freezer/moon/<app>`; all later Chromium/helper children
+therefore inherit the same isolated process-tree cgroup without a post-spawn
+race. The next lifecycle milestone uses those groups to suspend background CPU
+use. Moon still terminates all registered children during an intentional shell
 shutdown so an upgrade cannot leave unsupervised processes behind.
 
 The lock screen is a UI/session lock, not a cryptographic security boundary.

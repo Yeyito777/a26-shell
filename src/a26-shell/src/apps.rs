@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+use crate::freezer::FreezerGroup;
 use crate::model::{AppId, AppLifecycle, PublicAppState};
 
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
@@ -34,6 +35,7 @@ struct Application {
     child: Option<Child>,
     lifecycle: AppLifecycle,
     windows: Vec<ManagedWindow>,
+    freezer: FreezerGroup,
 }
 
 impl Application {
@@ -44,6 +46,7 @@ impl Application {
             child: None,
             lifecycle: AppLifecycle::Stopped,
             windows: Vec::new(),
+            freezer: FreezerGroup::prepare(id),
         }
     }
 
@@ -57,6 +60,8 @@ impl Application {
             lifecycle: self.lifecycle,
             pid: self.pid(),
             windows: self.windows.iter().map(|window| window.id).collect(),
+            freezer_cgroup: self.freezer.public_path(),
+            freezer_state: self.freezer.state(),
         }
     }
 
@@ -67,6 +72,7 @@ impl Application {
         }
         self.lifecycle = AppLifecycle::Stopped;
         self.windows.clear();
+        self.freezer.note_stopped();
     }
 }
 
@@ -208,6 +214,7 @@ impl AppRegistry {
                     application.child = None;
                     application.lifecycle = AppLifecycle::Stopped;
                     application.windows.clear();
+                    application.freezer.note_stopped();
                     if desired == Some(application.id) {
                         update.active_process_exited = Some(application.id);
                     }
@@ -265,29 +272,41 @@ impl AppRegistry {
                 }
                 update.resumed = Some(active);
             }
-            AppLifecycle::Stopped => match Command::new(&application.executable)
-                .env(
-                    "DISPLAY",
-                    env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
-                )
-                .stdin(Stdio::null())
-                .spawn()
-            {
-                Ok(process) => {
+            AppLifecycle::Stopped => {
+                let mut command = Command::new(&application.executable);
+                command
+                    .env(
+                        "DISPLAY",
+                        env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
+                    )
+                    .stdin(Stdio::null());
+                if let Err(error) = application.freezer.configure_spawn(&mut command) {
                     eprintln!(
-                        "started {} pid={}",
-                        application.id.display_name(),
-                        process.id()
+                        "cannot isolate {} before launch: {error}",
+                        application.id.display_name()
                     );
-                    application.child = Some(process);
-                    application.lifecycle = AppLifecycle::Launching;
-                }
-                Err(error) => {
-                    eprintln!("cannot start {}: {error}", application.executable.display());
                     update.active_process_failed = Some(active);
                     self.active = None;
+                    return update;
                 }
-            },
+                match command.spawn() {
+                    Ok(process) => {
+                        eprintln!(
+                            "started {} pid={}",
+                            application.id.display_name(),
+                            process.id()
+                        );
+                        application.child = Some(process);
+                        application.freezer.note_spawned();
+                        application.lifecycle = AppLifecycle::Launching;
+                    }
+                    Err(error) => {
+                        eprintln!("cannot start {}: {error}", application.executable.display());
+                        update.active_process_failed = Some(active);
+                        self.active = None;
+                    }
+                }
+            }
             AppLifecycle::Launching | AppLifecycle::Foreground => {}
         }
         update

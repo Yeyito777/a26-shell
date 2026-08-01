@@ -92,6 +92,10 @@ bind_mount /proc "$A26_ROOT/proc"
 bind_mount /sys "$A26_ROOT/sys"
 bind_mount /dev "$A26_ROOT/dev"
 bind_mount /dev/pts "$A26_ROOT/dev/pts"
+# /dev is a plain bind, so its nested controller mounts must be included
+# explicitly. Moon assigns each app before exec so every descendant inherits
+# the same freezer group without a post-spawn race.
+if [ -d /dev/freezer ]; then bind_mount /dev/freezer "$A26_ROOT/dev/freezer"; fi
 if [ -e /dev/binderfs ]; then bind_mount /dev/binderfs "$A26_ROOT/dev/binderfs"; fi
 tmpfs_mount "$A26_ROOT/run" 0755
 tmpfs_mount "$A26_ROOT/tmp" 1777
