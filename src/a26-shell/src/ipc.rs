@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::keyboard::KeyboardPurpose;
+use crate::lease::LeaseKind;
+use crate::model::AppId;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -32,6 +34,8 @@ pub enum Command {
     Power,
     ScreenOff,
     ScreenOn,
+    LeaseAcquire(AppId, LeaseKind, u64),
+    LeaseRelease(AppId, LeaseKind),
     Quit,
 }
 
@@ -200,6 +204,31 @@ fn parse_command(line: &str) -> Result<Command, String> {
             Some(_) => return Err("screen requires on or off".into()),
             None => return Err("screen requires on or off".into()),
         },
+        "lease" => {
+            let operation = parts
+                .next()
+                .ok_or_else(|| "lease requires acquire or release".to_string())?;
+            let app = parts
+                .next()
+                .and_then(AppId::parse)
+                .ok_or_else(|| "lease app must be system or browser".to_string())?;
+            let kind = parts
+                .next()
+                .and_then(LeaseKind::parse)
+                .ok_or_else(|| "lease kind must be media or transfer".to_string())?;
+            match operation {
+                "acquire" => {
+                    let seconds = parts
+                        .next()
+                        .ok_or_else(|| "lease acquire requires seconds".to_string())?
+                        .parse::<u64>()
+                        .map_err(|_| "invalid lease duration".to_string())?;
+                    Command::LeaseAcquire(app, kind, seconds)
+                }
+                "release" => Command::LeaseRelease(app, kind),
+                _ => return Err("lease requires acquire or release".into()),
+            }
+        }
         _ => return Err(format!("unknown command: {name}")),
     };
     no_extra(parts)?;
@@ -222,5 +251,19 @@ mod tests {
         ));
         assert!(parse_command("keyboard show secret").is_err());
         assert!(parse_command("keyboard show password extra").is_err());
+    }
+
+    #[test]
+    fn parses_only_bounded_lease_vocabulary() {
+        assert!(matches!(
+            parse_command("lease acquire browser media 5"),
+            Ok(Command::LeaseAcquire(AppId::Browser, LeaseKind::Media, 5))
+        ));
+        assert!(matches!(
+            parse_command("lease release system transfer"),
+            Ok(Command::LeaseRelease(AppId::System, LeaseKind::Transfer))
+        ));
+        assert!(parse_command("lease acquire browser arbitrary 5").is_err());
+        assert!(parse_command("lease release browser media extra").is_err());
     }
 }

@@ -49,6 +49,13 @@ background CPU use to zero. Moon still terminates all registered children during
 an intentional shell shutdown so an upgrade cannot leave unsupervised processes
 behind.
 
+Trusted root clients can temporarily keep a background process tree runnable
+with `lease acquire <system|browser> <media|transfer> <seconds>`, and end it with
+`lease release <system|browser> <media|transfer>`. Media leases are limited to
+30 seconds and transfer leases to 120 seconds; clients renew while real work is
+active. Expiry or release automatically refreezes a background app. Lease state
+exposes only the fixed purpose and remaining duration through `state`.
+
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
 design. IPC access is restricted to the root-owned chroot runtime.

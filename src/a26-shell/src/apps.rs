@@ -1,8 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::freezer::FreezerGroup;
+use crate::freezer::{FreezerGroup, FreezerState};
+use crate::lease::{LeaseKind, LeaseManager, PublicLeaseState};
 use crate::model::{AppId, AppLifecycle, PublicAppState};
 
 const DEFAULT_SYSTEM_APP: &str = "/opt/a26-system/bin/a26-system";
@@ -55,7 +57,7 @@ impl Application {
         self.child.as_ref().map(Child::id)
     }
 
-    fn public(&self) -> PublicAppState {
+    fn public(&self, leases: Vec<PublicLeaseState>) -> PublicAppState {
         PublicAppState {
             app: self.id,
             lifecycle: self.lifecycle,
@@ -63,6 +65,7 @@ impl Application {
             windows: self.windows.iter().map(|window| window.id).collect(),
             freezer_cgroup: self.freezer.public_path(),
             freezer_state: self.freezer.state(),
+            leases,
         }
     }
 
@@ -86,6 +89,7 @@ impl Application {
 pub struct AppRegistry {
     applications: [Application; 2],
     active: Option<AppId>,
+    leases: LeaseManager,
 }
 
 impl AppRegistry {
@@ -106,6 +110,7 @@ impl AppRegistry {
                 Application::new(AppId::Browser, browser),
             ],
             active: None,
+            leases: LeaseManager::default(),
         }
     }
 
@@ -114,7 +119,11 @@ impl AppRegistry {
     }
 
     pub fn public(&self) -> Vec<PublicAppState> {
-        self.applications.iter().map(Application::public).collect()
+        let now = Instant::now();
+        self.applications
+            .iter()
+            .map(|application| application.public(self.leases.public(application.id, now)))
+            .collect()
     }
 
     pub fn active_windows(&self) -> Vec<u32> {
@@ -213,6 +222,8 @@ impl AppRegistry {
 
     pub fn reconcile(&mut self, desired: Option<AppId>) -> RegistryUpdate {
         let mut update = RegistryUpdate::default();
+        let now = Instant::now();
+        self.leases.expire(now);
         for application in &mut self.applications {
             let result = application.child.as_mut().map(Child::try_wait);
             match result {
@@ -222,6 +233,7 @@ impl AppRegistry {
                     application.lifecycle = AppLifecycle::Stopped;
                     application.windows.clear();
                     application.freezer.note_stopped();
+                    self.leases.clear_app(application.id);
                     if desired == Some(application.id) {
                         update.active_process_exited = Some(application.id);
                     }
@@ -242,8 +254,27 @@ impl AppRegistry {
             return update;
         }
 
+        // An app with a lease remains thawed while backgrounded. As soon as its
+        // final bounded lease expires, the ordinary reconciliation pass puts
+        // it back into the freezer even if another app is foreground.
+        for id in [AppId::System, AppId::Browser] {
+            let needs_freeze = {
+                let application = self.app(id);
+                desired != Some(id)
+                    && application.lifecycle == AppLifecycle::Background
+                    && matches!(
+                        application.freezer.state(),
+                        FreezerState::Thawed | FreezerState::Unknown
+                    )
+            };
+            if needs_freeze && !self.leases.active(id, now) {
+                update.freeze_after_hide.push(id);
+            }
+        }
+
         if self.active != desired {
             if let Some(previous) = self.active {
+                let leased = self.leases.active(previous, now);
                 let application = self.app_mut(previous);
                 if application.lifecycle != AppLifecycle::Stopped {
                     application.lifecycle = AppLifecycle::Background;
@@ -253,7 +284,9 @@ impl AppRegistry {
                             update.visibility.push(WindowVisibility::Hide(window.id));
                         }
                     }
-                    update.freeze_after_hide.push(previous);
+                    if !leased {
+                        update.freeze_after_hide.push(previous);
+                    }
                 }
             }
             self.active = desired;
@@ -332,12 +365,49 @@ impl AppRegistry {
             application.stop();
         }
         self.active = None;
+        self.leases = LeaseManager::default();
     }
 
     pub fn freeze_background(&mut self, id: AppId) -> std::io::Result<()> {
         let application = self.app_mut(id);
         if application.lifecycle == AppLifecycle::Background {
             application.freezer.freeze()?;
+        }
+        Ok(())
+    }
+
+    pub fn acquire_lease(
+        &mut self,
+        app: AppId,
+        kind: LeaseKind,
+        seconds: u64,
+        now: Instant,
+    ) -> Result<Duration, &'static str> {
+        if self.app(app).lifecycle == AppLifecycle::Stopped {
+            return Err("cannot lease a stopped app");
+        }
+        let duration = self.leases.acquire(app, kind, seconds, now)?;
+        if self.app(app).lifecycle == AppLifecycle::Background
+            && self.app(app).freezer.thaw().is_err()
+        {
+            self.leases.release(app, kind);
+            return Err("cannot thaw leased app");
+        }
+        Ok(duration)
+    }
+
+    pub fn release_lease(
+        &mut self,
+        app: AppId,
+        kind: LeaseKind,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        self.leases.release(app, kind);
+        if self.app(app).lifecycle == AppLifecycle::Background && !self.leases.active(app, now) {
+            self.app(app)
+                .freezer
+                .freeze()
+                .map_err(|_| "cannot freeze released app")?;
         }
         Ok(())
     }

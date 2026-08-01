@@ -6,6 +6,7 @@ mod freezer;
 mod input;
 mod ipc;
 mod keyboard;
+mod lease;
 mod model;
 mod status;
 mod status_bar;
@@ -356,6 +357,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         for (stream, request) in ipc.accept_all() {
             match request {
                 Ok(command) => {
+                    let lease_result = match &command {
+                        Command::LeaseAcquire(app, kind, seconds) => apps
+                            .acquire_lease(*app, *kind, *seconds, Instant::now())
+                            .map(|_| ()),
+                        Command::LeaseRelease(app, kind) => {
+                            apps.release_lease(*app, *kind, Instant::now())
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = lease_result {
+                        ipc::respond::<model::PublicState>(stream, Err(error));
+                        continue;
+                    }
                     apply_command(
                         &conn,
                         root,
@@ -1605,6 +1619,7 @@ fn apply_command(
         Command::Power => state.toggle_screen(),
         Command::ScreenOff => state.screen_off(),
         Command::ScreenOn => state.screen_on(),
+        Command::LeaseAcquire(_, _, _) | Command::LeaseRelease(_, _) => {}
         Command::Quit => state.should_exit = true,
     }
 }

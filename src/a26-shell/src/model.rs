@@ -8,6 +8,7 @@ use crate::freezer::FreezerState;
 use crate::keyboard::{
     KeyAction, KeyboardEffect, KeyboardPurpose, KeyboardState, PublicKeyboardState,
 };
+use crate::lease::PublicLeaseState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +39,14 @@ impl AppId {
         match self {
             Self::System => "System",
             Self::Browser => "Browser",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "system" => Some(Self::System),
+            "browser" => Some(Self::Browser),
+            _ => None,
         }
     }
 
@@ -73,6 +82,7 @@ pub struct PublicAppState {
     pub windows: Vec<u32>,
     pub freezer_cgroup: Option<String>,
     pub freezer_state: FreezerState,
+    pub leases: Vec<PublicLeaseState>,
 }
 
 impl View {

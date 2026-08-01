@@ -87,6 +87,15 @@ done
 state="$($CTL state)"
 python3 -c 'import json,sys; app=next(a for a in json.load(sys.stdin)["result"]["apps"] if a["app"] == "system"); assert app["lifecycle"] == "background"; assert app["freezer_state"] == "frozen"' <<<"$state"
 
+# A bounded media lease temporarily thaws the hidden process tree. Releasing
+# the final lease immediately restores ordinary background freezing.
+"$CTL" lease acquire system media 2 >/dev/null
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/freezer.state"' | tr -d '\r')" == THAWED ]]
+state="$($CTL state)"
+python3 -c 'import json,sys; app=next(a for a in json.load(sys.stdin)["result"]["apps"] if a["app"] == "system"); assert app["leases"][0]["kind"] == "media"; assert 0 < app["leases"][0]["remaining_ms"] <= 2000' <<<"$state"
+"$CTL" lease release system media >/dev/null
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/freezer.state"' | tr -d '\r')" == FROZEN ]]
+
 # Reopening thaws first, then resumes the same process and remaps its window.
 "$CTL" launch system >/dev/null
 for _ in $(seq 1 50); do
