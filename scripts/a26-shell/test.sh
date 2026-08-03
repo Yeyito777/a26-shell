@@ -122,31 +122,49 @@ fi
 after="$(field volume <<<"$($CTL state)")"
 [[ "$after" -eq "$expected" ]]
 
-# Power policy locks before blanking and wakes only to the lock screen.
-"$CTL" screen off >/dev/null
-state="$($CTL state)"
-[[ "$(field view <<<"$state")" == locked ]]
-[[ "$(field screen_awake <<<"$state")" == false ]]
-python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; assert d["suspend"]["phase"] == "screen_off" and d["suspend"]["hardware_awake"] is False and d["suspend"]["last_error"] is None; assert d["managed_windows"] == []' <<<"$state"
-[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /sys/class/backlight/panel/brightness"' | tr -d '\r')" == 0 ]]
-"$CTL" screen on >/dev/null
-state="$($CTL state)"
-[[ "$(field view <<<"$state")" == locked ]]
-[[ "$(field screen_awake <<<"$state")" == true ]]
-python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; assert d["suspend"]["phase"] == "awake" and d["suspend"]["hardware_awake"] is True and d["suspend"]["last_error"] is None' <<<"$state"
-[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /sys/class/backlight/panel/brightness"' | tr -d '\r')" -gt 0 ]]
-
-"$CTL" lock >/dev/null
-state="$($CTL state)"
-[[ "$(field view <<<"$state")" == locked ]]
-[[ "$(field pin_digits <<<"$state")" == 0 ]]
-
 # Deterministically exercise the same one-victim LRU path used by real
 # MemAvailable pressure, without allocating memory on the phone.
 "$CTL" memory-pressure simulate >/dev/null
 state="$($CTL state)"
 python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; app=next(a for a in d["apps"] if a["app"] == "system"); assert app["lifecycle"] == "stopped" and app["pid"] is None; assert d["last_action"] == "system_evicted_memory_pressure"' <<<"$state"
 [[ -z "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /dev/freezer/moon/system/cgroup.procs"' | tr -d '\r')" ]]
+
+# Power policy locks, quiesces Samsung DSI/DPU, enters mem/deep, and uses a
+# bounded RTC wake. The proven production boundary then warm-reboots because
+# this firmware cannot restore either Xorg's CRTC or Exynos DWC3 in place.
+# Autonomous startup must return with a new boot ID, configured USB, and a fresh
+# locked Moon session carrying the persisted suspend proof.
+state="$($CTL state)"
+deep_before="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["suspend"]["deep_suspend_count"])' <<<"$state")"
+boot_before="$(adb -s "$SERIAL" shell 'cat /proc/sys/kernel/random/boot_id' | tr -d '\r')"
+"$CTL" suspend test 5 >/dev/null
+resumed=0
+for _ in $(seq 1 720); do
+    if adb -s "$SERIAL" get-state >/dev/null 2>&1; then
+        # Do not invoke a26-enter-chroot while autonomous Xorg is establishing
+        # its own /dev, /run, and /tmp binds. A concurrent probe can unmount the
+        # takeover's device tree and make Xorg report "no screens found".
+        shell_ready="$(adb -s "$SERIAL" shell '/data/local/tmp/su -c '\''pidof a26-shell >/dev/null 2>&1 && test -S /data/local/a26-linux/run/a26-shell/control.sock && echo yes || true'\''' 2>/dev/null | tr -d '\r')"
+        if [[ "$shell_ready" == yes ]]; then
+            state="$($CTL state 2>/dev/null || true)"
+            if python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; assert d["screen_awake"] and d["suspend"]["phase"] == "awake"' <<<"$state" 2>/dev/null; then
+                resumed=1
+                break
+            fi
+        fi
+    fi
+    sleep 0.5
+done
+[[ "$resumed" == 1 ]]
+boot_after="$(adb -s "$SERIAL" shell 'cat /proc/sys/kernel/random/boot_id' | tr -d '\r')"
+[[ "$boot_after" != "$boot_before" ]]
+[[ "$(field view <<<"$state")" == locked ]]
+[[ "$(field screen_awake <<<"$state")" == true ]]
+python3 -c 'import json,sys; d=json.load(sys.stdin)["result"]; s=d["suspend"]; assert s["deep_available"] is True and s["deep_suspend_count"] == int(sys.argv[1]) + 1; assert s["last_suspend_ms"] >= 2000 and s["last_error"] is None; assert d["managed_windows"] == []' "$deep_before" <<<"$state"
+case "$(adb -s "$SERIAL" shell getprop sys.usb.state | tr -d '\r')" in *adb*) ;; *) exit 41 ;; esac
+[[ "$(adb -s "$SERIAL" shell '/data/local/tmp/su -c "cat /sys/class/backlight/panel/brightness"' | tr -d '\r')" -gt 0 ]]
+
+[[ "$(field pin_digits <<<"$state")" == 0 ]]
 
 mkdir -p "$PROJECT_ROOT/notes/a26-shell"
 printf '%s\n' "$state" >"$PROJECT_ROOT/notes/a26-shell/final-state.json"

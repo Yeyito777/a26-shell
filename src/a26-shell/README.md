@@ -82,6 +82,25 @@ frame while dark before restoring touch and brightness. Any preparation or
 hardware error rolls back to an awake locked state and is exposed as a fixed
 error code in `state.suspend`, never as a half-completed transition.
 
+After that transaction, and only when no media/transfer lease is active, Moon
+hands control to a detached Android-namespace supervisor. It terminates the old
+app session, disables Xorg's DSI output, and proves both DECON and DSIM runtime
+suspended before selecting kernel `deep` mem sleep. This ordering is mandatory:
+a direct `mem` request with Xorg's CRTC active was captured as a Samsung watchdog
+reset in `pmucal_local_disable`/`blkpwr_dpu`.
+
+The approved user wake source is the PMIC power key; RTC is enabled for alarms.
+Volume and USB/USB-PD wake are disabled only for the deep interval and restored
+exactly after resume, while charger/fuel-gauge safety sources remain untouched.
+This firmware cannot re-enable the Xorg-disabled DSI CRTC in place, and Exynos
+DWC3 remains detached after configfs plus core/glue-driver resets. The supervisor
+therefore persists the successful count/duration and performs a controlled warm
+reboot. Magisk autonomous startup reconstructs Samsung display/USB state and
+presents a fresh locked Moon session. The root-only `suspend test 2..30` command
+uses a bounded one-shot RTC wake to exercise this same production path. Counts,
+duration, inhibition, and fixed errors are reported in `state.suspend`. This is a
+safe but intentionally slow wake boundary; in-place resume remains future work.
+
 The lock screen is a UI/session lock, not a cryptographic security boundary.
 The unlocked bootloader, Magisk root and authorized ADB can all bypass it by
 design. IPC access is restricted to the root-owned chroot runtime.
@@ -95,6 +114,8 @@ Runtime paths on the phone:
 /etc/a26-shell/config.json
 /run/a26-shell/control.sock
 /run/moon-audio/{pcm,volume,bridge.pid}
+/run/moon-suspend/state
+/data/adb/moon/{moon-suspend-cycle.sh,suspend.log}
 /root/a26-shell.log
 ```
 

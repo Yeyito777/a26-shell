@@ -22,6 +22,7 @@
 !/scripts/device/moon-boot-supervisor.sh
 !/scripts/device/moon-audio-start.sh
 !/scripts/device/moon-audio-stop.sh
+!/scripts/device/moon-suspend-cycle.sh
 !/scripts/device/a26-enter-chroot.sh
 !/scripts/device/a26-xorg-takeover.sh
 !/scripts/device/a26-xorg-safety-watchdog.sh

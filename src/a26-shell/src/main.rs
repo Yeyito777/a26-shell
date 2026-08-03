@@ -31,7 +31,7 @@ use ipc::{Command, IpcServer};
 use keyboard::{KeyboardEffect, KeyboardGeometry, KeyboardSurface, XtestInjector};
 use model::{AppId, PointerGesture, ShellState, View};
 use status_bar::StatusBarSurface;
-use suspend::{SuspendAction, SuspendCoordinator};
+use suspend::{PersistedSuspendState, PlatformSuspend, SuspendAction, SuspendCoordinator};
 use ui::{KeypadAction, Renderer};
 use volume::VolumeSurface;
 use x11rb::connection::Connection;
@@ -279,7 +279,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             None
         }
     };
-    let mut suspend_coordinator = SuspendCoordinator::new(true);
+    let (platform_suspend, persisted_suspend) = match PlatformSuspend::open() {
+        Ok((port, persisted)) => {
+            eprintln!("deep suspend handoff ready (DPU quiesce, mem/deep, power+RTC wake)");
+            (Some(port), persisted)
+        }
+        Err(error) => {
+            eprintln!("deep suspend handoff unavailable: {error}");
+            (None, PersistedSuspendState::default())
+        }
+    };
+    let mut suspend_coordinator =
+        SuspendCoordinator::new(true, platform_suspend.is_some(), persisted_suspend);
     let mut raw_touch = RawTouchTracker::default();
     let mut app_viewport: Option<(u32, u16)> = None;
     let mut shell_inset = false;
@@ -380,6 +391,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 state.note_memory_eviction(app);
                             }
                             Ok(())
+                        }
+                        Command::SuspendTest(seconds) => {
+                            if platform_suspend.is_none() {
+                                Err("deep suspend handoff unavailable")
+                            } else {
+                                suspend_coordinator.arm_test_wake(Duration::from_secs(*seconds));
+                                state.screen_off();
+                                Ok(())
+                            }
                         }
                         _ => Ok(()),
                     };
@@ -602,6 +622,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         let now = Instant::now();
+        if suspend_coordinator.screen_is_off() {
+            let inhibited = apps.has_active_leases(now);
+            suspend_coordinator.set_deep_inhibited(inhibited);
+            if !inhibited && let Some(port) = platform_suspend.as_ref() {
+                let test_wake = suspend_coordinator.take_test_wake();
+                match port.request(test_wake) {
+                    Ok(()) => {
+                        suspend_coordinator.begin_deep_suspend();
+                        eprintln!(
+                            "deep suspend handed to device supervisor{}",
+                            test_wake
+                                .map(|after| format!(" with {}s RTC proof wake", after.as_secs()))
+                                .unwrap_or_default()
+                        );
+                        // The helper is now an independent Android-namespace
+                        // session. Ending this X client lets it terminate every
+                        // old app, quiesce DSI/DPU, suspend, and replace Xorg.
+                        state.should_exit = true;
+                    }
+                    Err(error) => {
+                        eprintln!("deep suspend handoff failed: {error}");
+                        state.screen_on();
+                        let _ = power_up_display(backlight.as_ref(), touchscreen.as_ref());
+                        suspend_coordinator.fail_wake("deep_suspend_handoff_failed");
+                    }
+                }
+            }
+        }
         let mut deadline = next_device_status.min(next_memory_status);
         if apps.browser_running() {
             deadline = deadline.min(next_media_activity);
@@ -1843,7 +1891,8 @@ fn apply_command(
         Command::ScreenOn => state.screen_on(),
         Command::LeaseAcquire(_, _, _)
         | Command::LeaseRelease(_, _)
-        | Command::SimulateMemoryPressure => {}
+        | Command::SimulateMemoryPressure
+        | Command::SuspendTest(_) => {}
         Command::Quit => state.should_exit = true,
     }
 }

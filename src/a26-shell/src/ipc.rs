@@ -38,6 +38,7 @@ pub enum Command {
     LeaseAcquire(AppId, LeaseKind, u64),
     LeaseRelease(AppId, LeaseKind),
     SimulateMemoryPressure,
+    SuspendTest(u64),
     Quit,
 }
 
@@ -240,6 +241,21 @@ fn parse_command(line: &str) -> Result<Command, String> {
             Some(_) => return Err("memory-pressure requires simulate".into()),
             None => return Err("memory-pressure requires simulate".into()),
         },
+        "suspend" => match parts.next() {
+            Some("test") => {
+                let seconds = parts
+                    .next()
+                    .ok_or_else(|| "suspend test requires seconds".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid suspend test duration".to_string())?;
+                if !(2..=30).contains(&seconds) {
+                    return Err("suspend test duration must be 2 through 30 seconds".into());
+                }
+                Command::SuspendTest(seconds)
+            }
+            Some(_) => return Err("suspend requires test".into()),
+            None => return Err("suspend requires test".into()),
+        },
         _ => return Err(format!("unknown command: {name}")),
     };
     no_extra(parts)?;
@@ -286,5 +302,16 @@ mod tests {
         ));
         assert!(parse_command("memory-pressure").is_err());
         assert!(parse_command("memory-pressure kill browser").is_err());
+    }
+
+    #[test]
+    fn suspend_test_alarm_is_strictly_bounded() {
+        assert!(matches!(
+            parse_command("suspend test 5"),
+            Ok(Command::SuspendTest(5))
+        ));
+        assert!(parse_command("suspend test 1").is_err());
+        assert!(parse_command("suspend test 31").is_err());
+        assert!(parse_command("suspend now").is_err());
     }
 }

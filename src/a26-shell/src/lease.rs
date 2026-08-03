@@ -117,6 +117,11 @@ impl LeaseManager {
             .filter(|deadline| *deadline > now)
             .min()
     }
+
+    pub fn any_active(&mut self, now: Instant) -> bool {
+        self.expire(now);
+        self.deadlines.iter().flatten().any(Option::is_some)
+    }
 }
 
 #[cfg(test)]

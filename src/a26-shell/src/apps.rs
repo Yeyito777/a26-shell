@@ -475,6 +475,10 @@ impl AppRegistry {
         self.leases.next_deadline(now)
     }
 
+    pub fn has_active_leases(&mut self, now: Instant) -> bool {
+        self.leases.any_active(now)
+    }
+
     pub fn evict_lru_background(&mut self, now: Instant) -> Option<AppId> {
         self.leases.expire(now);
         let mut candidate: Option<(AppId, Instant)> = None;

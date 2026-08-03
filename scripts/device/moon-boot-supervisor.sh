@@ -359,8 +359,32 @@ log 'Moon is the active default session'
 
 shell_unhealthy=0
 local_recoveries=0
-while [ -n "$(pidof Xorg 2>/dev/null || true)" ]; do
+suspend_cycle_seen=0
+while :; do
     sleep 30
+    # A detached, device-namespace helper owns planned deep suspend. During that
+    # interval Xorg and Moon intentionally disappear and are replaced. Never
+    # mistake that bounded lifecycle transition for a crash or race its clean
+    # Android DRM handoff. The helper removes `active` only after new Moon IPC is
+    # responsive, or after its failure path has restored Android.
+    if [ -e /data/local/tmp/moon-suspend/active ]; then
+        if [ "$suspend_cycle_seen" = 0 ]; then
+            log 'planned deep-suspend cycle is active; deferring liveness checks'
+            suspend_cycle_seen=1
+        fi
+        continue
+    fi
+    if [ "$suspend_cycle_seen" = 1 ]; then
+        if [ -n "$(pidof Xorg 2>/dev/null || true)" ] && moon_control 5 ping >/dev/null 2>&1; then
+            log 'planned deep-suspend cycle completed with replacement Xorg/Moon'
+            shell_unhealthy=0
+            suspend_cycle_seen=0
+        else
+            log 'planned deep-suspend cycle failed safely; leaving Android active'
+            break
+        fi
+    fi
+    [ -n "$(pidof Xorg 2>/dev/null || true)" ] || break
     if [ -e "$PERSIST/disabled" ]; then
         log 'disabled at runtime; restoring Android'
         /system/bin/sh /data/local/tmp/a26-android-graphics-restore.sh

@@ -573,7 +573,12 @@ mod tests {
             1080,
             2340,
             Vec::new(),
-            crate::suspend::SuspendCoordinator::new(true).public(),
+            crate::suspend::SuspendCoordinator::new(
+                true,
+                true,
+                crate::suspend::PersistedSuspendState::default(),
+            )
+            .public(),
         )
     }
 

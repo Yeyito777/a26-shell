@@ -107,6 +107,12 @@ tmpfs_mount "$A26_ROOT/tmp" 1777
 if [ -d /data/local/tmp/moon-audio ]; then
     bind_mount /data/local/tmp/moon-audio "$A26_ROOT/run/moon-audio"
 fi
+# Deep suspend is supervised from Android's mount namespace because Xorg must be
+# replaced after Samsung's DSI output has been disabled. Expose only its private
+# state directory to Moon; the privileged helper itself remains outside chroot.
+if [ -d /data/local/tmp/moon-suspend ]; then
+    bind_mount /data/local/tmp/moon-suspend "$A26_ROOT/run/moon-suspend"
+fi
 
 # Android commonly has no useful /etc/resolv.conf.  Prefer any actual host
 # nameserver, then legacy net.dns properties, then explicit public fallbacks.
