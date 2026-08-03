@@ -171,28 +171,78 @@ printf 'disabled\n' >"$volume" || fail wake_policy_failed
 printf 'disabled\n' >"$usbpd" || fail wake_policy_failed
 printf 'disabled\n' >"$usb" || fail wake_policy_failed
 
+# Android AlarmManager may have left an RTC alarm armed before the framework
+# handoff. Moon cannot service those Android alarms, so never let one convert a
+# normal screen-off into an unsolicited full wake. Item 11 will replace this
+# clear with Moon's own alarm schedule. The root-only proof command installs its
+# explicitly bounded alarm after the clear.
+echo 0 >/sys/class/rtc/rtc0/wakealarm || fail rtc_arm_failed
+alarm=0
 if [ "$TEST_SECONDS" -gt 0 ]; then
-    echo 0 >/sys/class/rtc/rtc0/wakealarm || fail rtc_arm_failed
     now="$(cat /sys/class/rtc/rtc0/since_epoch)"
     echo "+$TEST_SECONDS" >/sys/class/rtc/rtc0/wakealarm || fail rtc_arm_failed
     alarm="$(cat /sys/class/rtc/rtc0/wakealarm)"
     [ "$alarm" -ge $((now + TEST_SECONDS - 1)) ] || fail rtc_arm_failed
 fi
 
+irq_count() {
+    needle=$1
+    awk -v needle="$needle" '
+        index($0, needle) {
+            total=0
+            for (field=2; field<=NF && $field ~ /^[0-9]+$/; field++) total += $field
+            print total
+            found=1
+            exit
+        }
+        END { if (!found) print 0 }
+    ' /proc/interrupts
+}
+
 echo deep >/sys/power/mem_sleep || fail deep_select_failed
-before="$(cat /sys/class/rtc/rtc0/since_epoch)"
-log "entering mem/deep dpu=suspended rtc_alarm=$(cat /sys/class/rtc/rtc0/wakealarm 2>/dev/null || true)"
-sync
-if ! echo mem >/sys/power/state; then
-    fail deep_suspend_failed
-fi
-after="$(cat /sys/class/rtc/rtc0/since_epoch)"
-elapsed=$((after - before))
-[ "$elapsed" -ge 0 ] || elapsed=0
+total_elapsed=0
+while :; do
+    power_f_before="$(irq_count pwronf-irq)"
+    power_r_before="$(irq_count pwronr-irq)"
+    rtc_irq_before="$(irq_count rtc-alarm0)"
+    before="$(cat /sys/class/rtc/rtc0/since_epoch)"
+    log "entering mem/deep dpu=suspended rtc_alarm=$(cat /sys/class/rtc/rtc0/wakealarm 2>/dev/null || true)"
+    sync
+    if ! echo mem >/sys/power/state; then
+        fail deep_suspend_failed
+    fi
+    after="$(cat /sys/class/rtc/rtc0/since_epoch)"
+    elapsed=$((after - before))
+    [ "$elapsed" -ge 0 ] || elapsed=0
+    total_elapsed=$((total_elapsed + elapsed))
+    power_f_after="$(irq_count pwronf-irq)"
+    power_r_after="$(irq_count pwronr-irq)"
+    rtc_irq_after="$(irq_count rtc-alarm0)"
+
+    if [ "$power_f_after" -gt "$power_f_before" ] ||
+       [ "$power_r_after" -gt "$power_r_before" ]; then
+        wake_kind=power_key
+        break
+    fi
+    if [ "$TEST_SECONDS" -gt 0 ] && {
+       [ "$rtc_irq_after" -gt "$rtc_irq_before" ] || [ "$after" -ge "$alarm" ];
+    }; then
+        wake_kind=rtc_test
+        break
+    fi
+
+    # Charger, fuel-gauge, USB and incidental kernel wakeups are not user wake
+    # requests. Resume only long enough to classify them, then return to deep
+    # sleep with the display pipeline still safely quiesced. Avoid a tight loop
+    # if a pending wake source rejects entry immediately.
+    log "ignored non-user wake elapsed=${elapsed}s; returning to mem/deep"
+    [ "$elapsed" -gt 0 ] || sleep 1
+done
+
 restore_wake_policy
 count=$(( $(read_count) + 1 ))
-write_state "$count" "$((elapsed * 1000))" ''
-log "resumed from mem/deep elapsed=${elapsed}s; committing warm reboot"
+write_state "$count" "$((total_elapsed * 1000))" ''
+log "approved wake=$wake_kind elapsed=${total_elapsed}s; committing warm reboot"
 
 # This firmware has two independent post-resume limitations: Xorg cannot
 # re-enable a DSI CRTC once it was quiesced, and Exynos DWC3 remains physically

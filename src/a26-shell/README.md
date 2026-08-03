@@ -89,10 +89,15 @@ suspended before selecting kernel `deep` mem sleep. This ordering is mandatory:
 a direct `mem` request with Xorg's CRTC active was captured as a Samsung watchdog
 reset in `pmucal_local_disable`/`blkpwr_dpu`.
 
-The approved user wake source is the PMIC power key; RTC is enabled for alarms.
-Volume and USB/USB-PD wake are disabled only for the deep interval and restored
-exactly after resume, while charger/fuel-gauge safety sources remain untouched.
-This firmware cannot re-enable the Xorg-disabled DSI CRTC in place, and Exynos
+The approved user wake source is the PMIC power key; RTC is enabled for Moon
+alarms and the bounded proof command. Until the central alarm service in TODO 11
+exists, the handoff clears any stale Android AlarmManager RTC alarm. Volume and
+USB/USB-PD wake are disabled only for the deep interval and restored exactly
+after resume, while charger/fuel-gauge safety sources remain untouched. Their
+incidental wakeups are classified by PMIC/RTC IRQ deltas and immediately return
+to deep sleep; only a physical power-key press or an explicitly armed Moon RTC
+alarm proceeds to full wake. This firmware cannot re-enable the Xorg-disabled
+DSI CRTC in place, and Exynos
 DWC3 remains detached after configfs plus core/glue-driver resets. The supervisor
 therefore persists the successful count/duration and performs a controlled warm
 reboot. Magisk autonomous startup reconstructs Samsung display/USB state and
