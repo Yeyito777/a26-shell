@@ -1,5 +1,10 @@
 # A26 Shell
 
+> [!IMPORTANT]
+> A26 Shell has moved to **[Yeyito777/OSS-Phone-V1](https://github.com/Yeyito777/OSS-Phone-V1)**,
+> which continues its full history as part of an open-source phone operating
+> system for the Galaxy A26. This repository is archived and no longer updated.
+
 An experimental touch-first X11 phone shell and window manager written in Rust
 for the Samsung Galaxy A26.
 
